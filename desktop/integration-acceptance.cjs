@@ -9,6 +9,7 @@ const checkedFixtures = {
   'clip-001.ts': '1c0449ffe3cdc9e268c0f207325ed026ddcab98586d3f82f287b675c506c5656',
   'clip-002.ts': '3037b8078028a12bd160ea9856eab4e456de53449cdb85d63433c094daf928f9',
 };
+const mediaPrefix = '/__libretv-acceptance-media/';
 const outputPrefix = 'acceptance-output-';
 const videoFile = 'synthetic-download.mp4';
 const maxOutputBytes = 1024 * 1024;
@@ -46,21 +47,39 @@ async function readContainedFile(folder, name, limit) {
   }
 }
 
-async function fixturePayload(profile) {
-  const folder = path.join(profile, 'acceptance-fixtures');
-  const entries = await Promise.all(Object.entries(checkedFixtures).map(async ([name, expected]) => {
-    const bytes = await readContainedFile(folder, name, 256 * 1024);
-    if (!bytes) return null;
-    if (createHash('sha256').update(bytes).digest('hex') !== expected) throw new Error('Fixture hash mismatch');
-    return [name, name === 'sources.json' ? JSON.parse(bytes.toString('utf8')) : bytes.toString('base64')];
-  }));
-  const fixtures = Object.fromEntries(entries.filter(Boolean));
-  return {
-    sources: fixtures['sources.json'] ?? null,
-    media: Object.keys(checkedFixtures).slice(1).every((name) => fixtures[name])
-      ? Object.fromEntries(Object.entries(fixtures).filter(([name]) => name !== 'sources.json'))
-      : null,
-  };
+async function prepareIntegrationFixtures(profile) {
+  try {
+    verifySmokeProfile(profile);
+    const folder = path.join(profile, 'acceptance-fixtures');
+    const entries = await Promise.all(Object.entries(checkedFixtures).map(async ([name, expected]) => {
+      const bytes = await readContainedFile(folder, name, 256 * 1024);
+      if (!bytes) return null;
+      if (createHash('sha256').update(bytes).digest('hex') !== expected) throw new Error('Fixture hash mismatch');
+      return [name, bytes];
+    }));
+    const files = Object.fromEntries(entries.filter(Boolean));
+    const names = Object.keys(checkedFixtures).filter((name) => name !== 'sources.json');
+    return {
+      sources: files['sources.json'] ? JSON.parse(files['sources.json'].toString('utf8')) : null,
+      media: names.every((name) => files[name])
+        ? new Map(names.map((name) => [mediaPrefix + name, files[name]])) : null,
+    };
+  } catch {
+    return { sources: null, media: null, error: 'INTEGRATION_FIXTURE_INVALID' };
+  }
+}
+
+function serveIntegrationMedia(fixture, request, response) {
+  if (request.method !== 'GET' && request.method !== 'HEAD') return false;
+  const bytes = fixture?.media?.get(request.url);
+  if (!bytes) return false;
+  response.writeHead(200, {
+    'Content-Type': request.url.endsWith('.m3u8') ? 'application/vnd.apple.mpegurl' : 'video/mp2t',
+    'Content-Length': bytes.length,
+    'Cache-Control': 'no-store',
+  });
+  response.end(request.method === 'HEAD' ? undefined : bytes);
+  return true;
 }
 
 function createIntegrationSaveDialog(profile) {
@@ -85,7 +104,7 @@ async function inspectDownload(profile) {
 // This routine runs inside the existing smoke profile only. It exercises the
 // real renderer with bounded local fixture replies; production routes keep their
 // normal networking, provenance, and private-address checks.
-async function rendererBusiness({ sourceList, media, phase, origin, previous }) {
+async function rendererBusiness({ sourceList, media, playlistURL, phase, origin, previous }) {
   const checks = [];
   const title = 'LibreTV 集成验收合成短片';
   const settingsKey = 'libretv-settings';
@@ -93,7 +112,6 @@ async function rendererBusiness({ sourceList, media, phase, origin, previous }) 
   const subscriptionURL = fixtureOrigin + '/sources.json';
   const source = { name: '集成验收合成源', url: fixtureOrigin + '/vod' };
   const vodId = '3442026';
-  const playlistURL = fixtureOrigin + '/clip.m3u8';
   const settings = () => JSON.parse(localStorage.getItem(settingsKey) || '{}').state || {};
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   const eventually = async (probe, timeout = 5000) => {
@@ -105,14 +123,15 @@ async function rendererBusiness({ sourceList, media, phase, origin, previous }) 
     } while (performance.now() < deadline);
     throw new Error('Check timed out');
   };
-  const note = (name, status, detail, metrics) => checks.push({ name, status, detail, ...(metrics && { metrics }) });
-  const run = async (name, action, status, detail) => {
+  const note = (name, status, detail, metrics, code) => checks.push({ name, status, detail,
+    ...(metrics && { metrics }), ...(code && { code }) });
+  const run = async (name, action, status, detail, snapshot) => {
     try {
       const metrics = await action();
       note(name, status, detail, metrics);
       return true;
     } catch (error) {
-      note(name, 'FAIL', detail + '。' + (error instanceof Error ? error.message : '未完成'));
+      note(name, 'FAIL', detail + '。' + (error instanceof Error ? error.message : '未完成'), snapshot?.(), error?.code);
       return false;
     }
   };
@@ -141,11 +160,15 @@ async function rendererBusiness({ sourceList, media, phase, origin, previous }) 
       };
     });
   };
-  const getRecords = async () => ({
-    history: (await readDatabase('history')).some((item) => item.title === title && item.vodId === vodId),
-    progress: (await readDatabase('progress')).some((item) => String(item.key).endsWith('_' + vodId + '_0') && item.position > 0),
-    download: (await readDatabase('downloads')).find((item) => item.title === title && item.status === 'completed')?.id,
-  });
+  const getDownload = async () => (await readDatabase('downloads')).find((item) => item.title === title);
+  const getRecords = async () => {
+    const download = await getDownload();
+    return {
+      history: (await readDatabase('history')).some((item) => item.title === title && item.vodId === vodId),
+      progress: (await readDatabase('progress')).some((item) => String(item.key).endsWith('_' + vodId + '_0') && item.position > 0),
+      download: download?.status === 'completed' ? download.id : undefined,
+    };
+  };
   const presetState = async () => {
     const response = await fetch('/api/status', { cache: 'no-store', signal: AbortSignal.timeout(4000) });
     const data = await response.json();
@@ -216,30 +239,12 @@ async function rendererBusiness({ sourceList, media, phase, origin, previous }) 
     return { checks, observed: presets ? { presets } : undefined };
   }
 
-  const bytesFrom = (value) => Uint8Array.from(atob(value), (char) => char.charCodeAt(0));
-  const virtual = new Map();
-  for (const [name, body] of Object.entries(media || {})) {
-    const url = fixtureOrigin + '/' + name;
-    const bytes = bytesFrom(body);
-    const type = name.endsWith('.m3u8') ? 'application/vnd.apple.mpegurl' : 'video/mp2t';
-    const content = name.endsWith('.m3u8')
-      ? new TextDecoder().decode(bytes).replace(/^clip-\d{3}\.ts$/gm, (line) => fixtureOrigin + '/' + line)
-      : bytes;
-    virtual.set(url, new Blob([content], { type }));
-  }
-  const blobUrls = new Map();
   const sourceRows = [...(!presets && sourceList?.sources || []), source];
   const nativeFetch = window.fetch;
-  const nativeOpen = XMLHttpRequest.prototype.open;
   const cover = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=';
-  const hits = { search: 0, detail: 0, media: 0 };
+  const hits = { search: 0, detail: 0 };
   window.fetch = async function (input, init) {
     const url = new URL(input instanceof Request ? input.url : input, origin);
-    const asset = virtual.get(url.href);
-    if (asset) {
-      hits.media += 1;
-      return new Response(asset, { headers: { 'Content-Type': asset.type } });
-    }
     if (url.origin === origin && url.pathname === '/api/source-list' && url.searchParams.get('url') === subscriptionURL) {
       return Response.json({ name: '集成验收', version: 2, sources: sourceRows, liveSources: [] });
     }
@@ -263,16 +268,6 @@ async function rendererBusiness({ sourceList, media, phase, origin, previous }) 
         videoInfo: { title, cover, desc: '合成测试画面', sourceKey: params.key, sourceName: source.name } });
     }
     return nativeFetch.call(this, input, init);
-  };
-  XMLHttpRequest.prototype.open = function (method, url, ...options) {
-    const address = new URL(url, origin).href;
-    const asset = virtual.get(address);
-    if (method === 'GET' && asset) {
-      if (!blobUrls.has(address)) blobUrls.set(address, URL.createObjectURL(asset));
-      hits.media += 1;
-      return nativeOpen.call(this, method, blobUrls.get(address), ...options);
-    }
-    return nativeOpen.call(this, method, url, ...options);
   };
 
   try {
@@ -354,33 +349,86 @@ async function rendererBusiness({ sourceList, media, phase, origin, previous }) 
     }, 'PARTIAL', '真实搜索卡片、详情剧集和进入播放页，应用 API 返回由隔离夹具提供');
 
     if (searched) {
+      const fault = (code) => Object.assign(new Error(code), { code });
+      const waitStage = (code, probe, timeout) => eventually(probe, timeout).catch((error) => {
+        throw error.code ? error : fault(code);
+      });
+      const segmentUrls = new Set(Array.from({ length: 3 }, (_, index) =>
+        new URL('clip-00' + index + '.ts', playlistURL).href));
+      const mediaRequests = (initiatorType) => {
+        const entries = performance.getEntriesByType('resource').filter((entry) => entry.initiatorType === initiatorType);
+        return {
+          manifestReads: entries.filter(({ name }) => name === playlistURL).length,
+          segmentReads: entries.filter(({ name }) => segmentUrls.has(name)).length,
+        };
+      };
+      let video;
+      let playRejected = false;
+      const videoMetrics = () => ({
+        ...mediaRequests('xmlhttprequest'), videoPresent: Boolean(video), playRejected,
+        readyState: video?.readyState ?? -1, networkState: video?.networkState ?? -1,
+        mediaError: video?.error?.code ?? 0, videoWidth: video?.videoWidth ?? 0,
+        currentTimeMs: Math.round((video?.currentTime ?? 0) * 1000),
+      });
       await run('media-playback', async () => {
-        const video = await eventually(() => document.querySelector('video'));
-        await eventually(() => video.readyState >= 2 && Number.isFinite(video.duration));
+        video = await waitStage('MEDIA_ELEMENT_TIMEOUT', () => document.querySelector('main video'));
+        const checkVideo = () => { if (video.error) throw fault('MEDIA_ELEMENT_ERROR'); };
+        await waitStage('MEDIA_METADATA_TIMEOUT', () => {
+          checkVideo();
+          return video.readyState >= 2 && Number.isFinite(video.duration) && video.duration > 0;
+        });
         if (video.paused) {
           video.muted = true;
-          await Promise.race([video.play(), sleep(2500)]);
+          void video.play().catch(() => { playRejected = true; });
         }
-        await eventually(() => video.currentTime > 0.15 && video.videoWidth > 0);
+        await waitStage('MEDIA_PLAYBACK_TIMEOUT', () => {
+          checkVideo();
+          return video.currentTime > 0.15 && video.videoWidth > 0;
+        });
         const duration = video.duration;
-        const seekTime = Math.max(1.5, duration - 0.85);
+        const seekTime = duration / 2;
         video.currentTime = seekTime;
-        await eventually(() => !video.seeking && video.currentTime >= seekTime - 0.2);
+        await waitStage('MEDIA_SEEK_TIMEOUT', () => {
+          checkVideo();
+          return !video.seeking && Math.abs(video.currentTime - seekTime) < 0.4;
+        });
         video.pause();
-        if (!video.paused || hits.media === 0) throw new Error('实际合成媒体未观测到播放和暂停');
-        return { durationSeconds: Math.round(duration * 100) / 100, mediaReads: hits.media };
-      }, 'PASS', 'ArtPlayer 实际解码并播放有权使用的合成 HLS，验证时间进度、跳转和暂停');
+        const metrics = videoMetrics();
+        if (!video.paused || !metrics.manifestReads || !metrics.segmentReads) throw fault('MEDIA_TRANSPORT_UNOBSERVED');
+        return { ...metrics, durationSeconds: Math.round(duration * 100) / 100 };
+      }, 'PASS', 'ArtPlayer 实际解码并播放有权使用的合成 HLS，验证时间进度、跳转和暂停', videoMetrics);
 
+      let task;
+      let beforeDownload = mediaRequests('fetch');
+      const downloadMetrics = () => {
+        const current = mediaRequests('fetch');
+        return {
+          manifestReads: Math.max(0, current.manifestReads - beforeDownload.manifestReads),
+          segmentReads: Math.max(0, current.segmentReads - beforeDownload.segmentReads),
+          taskObserved: Boolean(task), taskFailed: task?.status === 'error',
+          finishedSegments: task?.finished ?? 0, totalSegments: task?.total ?? 0,
+        };
+      };
+      const readTask = async () => {
+        task = await getDownload();
+        if (task?.status === 'error') throw fault('DOWNLOAD_TASK_ERROR');
+        return task;
+      };
       await run('native-download', async () => {
-        const trigger = await eventually(() => button('下载本集'));
+        const trigger = await waitStage('DOWNLOAD_BUTTON_TIMEOUT', () => button('下载本集'));
+        beforeDownload = mediaRequests('fetch');
         trigger.click();
-        const completed = await eventually(async () => (await getRecords()).download, 14000);
+        await waitStage('DOWNLOAD_QUEUE_TIMEOUT', readTask);
+        const completed = await waitStage('DOWNLOAD_COMPLETE_TIMEOUT', async () => {
+          const entry = await readTask();
+          return entry?.status === 'completed' && entry.id;
+        }, 14000);
         const receipts = await window.libretvDownloads.reconcile();
         if (!receipts.some((item) => item.taskId === completed && item.status === 'completed')) {
-          throw new Error('下载 UI 完成但未找到原生下载回执');
+          throw fault('DOWNLOAD_RECEIPT_MISSING');
         }
-        return { completed: true };
-      }, 'PASS', '下载按钮经过生产下载器、IPC 和磁盘写入，原生完成回执可核对');
+        return { ...downloadMetrics(), completed: true };
+      }, 'PASS', '下载按钮经过生产下载器、IPC 和磁盘写入，原生完成回执可核对', downloadMetrics);
     } else {
       note('media-playback', 'NOT RUN', '未进入合成播放页面');
       note('native-download', 'NOT RUN', '未进入合成播放页面');
@@ -389,9 +437,63 @@ async function rendererBusiness({ sourceList, media, phase, origin, previous }) 
     return { checks, observed };
   } finally {
     window.fetch = nativeFetch;
-    XMLHttpRequest.prototype.open = nativeOpen;
-    for (const url of blobUrls.values()) URL.revokeObjectURL(url);
   }
+}
+
+function observeIndexedDb() {
+  const metrics = { opened: false, wrote: false, readBack: false };
+  return new Promise((resolve) => {
+    let database;
+    let transaction;
+    let done = false;
+    let phase = 'OPEN';
+    const finish = (code) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      database?.close();
+      resolve({ name: 'indexeddb', status: code ? 'FAIL' : 'PASS',
+        detail: '隔离 IndexedDB 事务提交及独立事务读回', metrics, ...(code && { code }) });
+    };
+    const timer = setTimeout(() => {
+      finish('INDEXEDDB_' + phase + '_TIMEOUT');
+      try { transaction?.abort(); } catch { /* Transaction already settled. */ }
+    }, 4000);
+    try {
+      const open = indexedDB.open('libretv-acceptance-storage', 1);
+      open.onerror = () => finish('INDEXEDDB_OPEN_ERROR');
+      open.onblocked = () => finish('INDEXEDDB_OPEN_BLOCKED');
+      open.onupgradeneeded = () => {
+        if (done) open.transaction.abort();
+        else open.result.createObjectStore('probe');
+      };
+      open.onsuccess = () => {
+        database = open.result;
+        if (done) { database.close(); return; }
+        metrics.opened = true;
+        phase = 'WRITE';
+        try {
+          transaction = database.transaction('probe', 'readwrite');
+          transaction.onerror = transaction.onabort = () => finish('INDEXEDDB_WRITE_ERROR');
+          transaction.oncomplete = () => {
+            if (done) return;
+            metrics.wrote = true;
+            phase = 'READ';
+            try {
+              const read = database.transaction('probe').objectStore('probe').get('ready');
+              read.onerror = () => finish('INDEXEDDB_READ_ERROR');
+              read.onsuccess = () => {
+                if (done) return;
+                metrics.readBack = read.result === 1;
+                finish(metrics.readBack ? null : 'INDEXEDDB_READ_MISMATCH');
+              };
+            } catch { finish('INDEXEDDB_READ_ERROR'); }
+          };
+          transaction.objectStore('probe').put(1, 'ready');
+        } catch { finish('INDEXEDDB_WRITE_ERROR'); }
+      };
+    } catch { finish('INDEXEDDB_OPEN_ERROR'); }
+  });
 }
 
 async function verifyPlaybackFile(base64) {
@@ -420,18 +522,26 @@ async function verifyPlaybackFile(base64) {
   }
 }
 
-async function observeBusiness(window, log, { profile, phase, origin }) {
+async function observeBusiness(window, log, { profile, phase, origin, fixture }) {
   verifySmokeProfile(profile);
   if (phase !== 'initial' && phase !== 'restart') throw new Error('Invalid integration phase');
+  try {
+    const storage = await window.webContents.executeJavaScript('(' + observeIndexedDb.toString() + ')()');
+    log('integration-check', storage);
+  } catch {
+    log('integration-check', { name: 'indexeddb', status: 'FAIL', code: 'INDEXEDDB_PROBE_EXECUTION' });
+  }
   const names = phase === 'initial' ? ['preset-initial', 'source-import', 'vod-search', 'media-playback', 'native-download']
     : ['business-persistence', 'preset-restart'];
   let args;
   let observed;
   try {
-    const inspection = phase === 'initial' ? await fixturePayload(profile) : {};
+    const inspection = phase === 'initial' ? fixture ?? {} : {};
+    if (inspection.error) throw Object.assign(new Error('Fixture preparation failed'), { code: inspection.error });
     const previous = phase === 'restart' ? await readContainedFile(profile, 'acceptance-observed.json', 2048) : null;
     args = {
-      sourceList: inspection.sources, media: inspection.media, origin, phase,
+      sourceList: inspection.sources, media: Boolean(inspection.media), origin, phase,
+      playlistURL: new URL(mediaPrefix + 'clip.m3u8', origin).href,
       previous: previous ? JSON.parse(previous.toString('utf8')) : undefined,
     };
     observed = await window.webContents.executeJavaScript('(' + rendererBusiness.toString() + ')(' + JSON.stringify(args) + ')', true);
@@ -479,4 +589,4 @@ async function observeBusiness(window, log, { profile, phase, origin }) {
   for (const check of observed.checks) log('integration-check', check);
 }
 
-module.exports = { createIntegrationSaveDialog, observeBusiness };
+module.exports = { createIntegrationSaveDialog, observeBusiness, prepareIntegrationFixtures, serveIntegrationMedia };

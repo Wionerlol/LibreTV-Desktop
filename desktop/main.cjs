@@ -10,7 +10,9 @@ const { waitForSmokeClose } = require('./smoke-control.cjs');
 const { observeRenderer } = require('./renderer-acceptance.cjs');
 const { observeFullscreen } = require('./fullscreen-acceptance.cjs');
 const { observeCanary } = require('./canary-acceptance.cjs');
-const { observeBusiness, createIntegrationSaveDialog } = require('./integration-acceptance.cjs');
+const {
+  observeBusiness, createIntegrationSaveDialog, prepareIntegrationFixtures, serveIntegrationMedia,
+} = require('./integration-acceptance.cjs');
 
 const smoke = process.argv.find((arg) => /^--libretv-smoke=[a-f0-9]{32}$/.test(arg))?.split('=')[1];
 const integration = smoke && process.argv.find((arg) => /^--libretv-integration=(initial|restart)$/.test(arg))?.split('=')[1];
@@ -116,7 +118,7 @@ async function smokeRenderer() {
   }
 }
 
-async function observeIntegration(desktop) {
+async function observeIntegration(desktop, fixture) {
   const histogram = monitorEventLoopDelay({ resolution: 20 });
   const started = performance.now();
   const cpu = process.cpuUsage();
@@ -128,7 +130,7 @@ async function observeIntegration(desktop) {
     }
     await desktop.load(window, '/');
     await observeBusiness(window, log, {
-      profile, phase: integration, origin: ORIGIN, load: (route) => desktop.load(window, route),
+      profile, phase: integration, origin: ORIGIN, fixture,
     });
   } catch {
     log('integration-check', { name: 'integration-dispatch', status: 'FAIL', detail: 'Integration probe stopped unexpectedly' });
@@ -166,7 +168,12 @@ async function start() {
   nextApp = runtimeRequire('next')({ dev: false, dir: runtime, hostname: HOST, port: PORT });
   await nextApp.prepare();
   if (shuttingDown) return;
-  desktop.enable(nextApp.getRequestHandler());
+  const handleNext = nextApp.getRequestHandler();
+  const fixture = integration === 'initial' ? await prepareIntegrationFixtures(profile) : undefined;
+  desktop.enable(fixture?.media ? (request, response) => {
+    if (serveIntegrationMedia(fixture, request, response)) return;
+    return handleNext(request, response);
+  } : handleNext);
   log('next-prepared', {
     buildId: manifest.buildId, commit: manifest.commit, next: manifest.next,
     electron: process.versions.electron, node: process.versions.node, arch: process.arch,
@@ -212,7 +219,7 @@ async function start() {
   await desktop.load(window, '/live');
   log('renderer-loaded', { route: '/live' });
   await smokeRenderer();
-  if (integration) await observeIntegration(desktop);
+  if (integration) await observeIntegration(desktop, fixture);
   log('smoke-ready', { control: 'file-v1' });
   await waitForSmokeClose(profile);
   log('smoke-close-requested');
