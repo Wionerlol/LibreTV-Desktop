@@ -29,17 +29,25 @@ export async function POST(req: Request) {
 
   const start = Date.now();
   try {
-    const res = await fetchUpstream(`${url}?ac=videolist&wd=test`, {
+    const api = new URL(url);
+    api.searchParams.set('ac', 'videolist');
+    api.searchParams.set('wd', 'test');
+    const res = await fetchUpstream(api.href, {
       timeoutMs: 6000,
+      signal: req.signal,
       headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36', Accept: 'application/json' },
     });
-    const ms = Date.now() - start;
     if (!res.ok) {
-      return NextResponse.json({ ok: false, ms, error: `HTTP ${res.status}` });
+      return NextResponse.json({ ok: false, ms: Date.now() - start, error: `HTTP ${res.status}` });
     }
-    const data = await res.json();
+    const data: unknown = await res.json();
+    if (!data || typeof data !== 'object' || !('list' in data)) {
+      throw new Error('API返回的数据格式无效');
+    }
     const list = parseSearchList(data, { key: 'test', name: 'test', url });
-    return NextResponse.json({ ok: true, ms, count: list.length });
+    const count = list.filter((item) => item.vodId && item.name).length;
+    if (list.length && !count) throw new Error('API返回的数据格式无效');
+    return NextResponse.json({ ok: true, ms: Date.now() - start, count });
   } catch (err) {
     return NextResponse.json({
       ok: false,

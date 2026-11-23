@@ -15,6 +15,7 @@ import {
 import { loadDownloadSettings, saveDownloadSettings } from '@/lib/download-settings';
 import { detectSavingCapability, pickSaveTarget, UserCancelledError, type SaveTarget } from '@/lib/download-saver';
 import { Switch } from './settings-shared';
+import { getDesktopDownloadBridge } from '@/lib/desktop-download-target';
 
 /**
  * 全局下载管理器（UI 采用本站 Drawer 模式）：
@@ -72,6 +73,35 @@ export function DownloadManager({ isOpen, onClose }: { isOpen: boolean; onClose:
   useEffect(() => {
     setProxy(loadDownloadSettings().proxy);
   }, []);
+
+  useEffect(() => {
+    const bridge = getDesktopDownloadBridge();
+    if (!bridge?.reconcile) return;
+    let disposed = false;
+    void bridge.reconcile().then(async (recoveries) => {
+      if (disposed || recoveries.length === 0) return;
+      await db.transaction('rw', db.downloads, async () => {
+        for (const recovery of recoveries) {
+          const id = recovery.taskId;
+          const entry = await db.downloads.get(id);
+          if (!entry || disposed || running.current.has(id) || queuedTargets.current.has(id) ||
+              pickingTargets.current.has(id) || removing.current.has(id)) continue;
+          const blocked = recovery.status === 'needs_reconcile';
+          if (entry.status === 'completed' && !blocked) continue;
+          const status = recovery.status === 'completed' ? 'completed' : blocked ? 'error' : 'paused';
+          if (entry.status === status && !!entry.desktopRecoveryBlocked === blocked) continue;
+          await db.downloads.update(id, {
+            status, desktopRecoveryBlocked: blocked, updatedAt: Date.now(),
+            ...(status === 'completed' ? { finished: entry.total, errorNum: 0 } : {}),
+          });
+        }
+      });
+      if (!disposed) refresh();
+    }).catch(() => {
+      if (!disposed) toast('无法核对桌面下载记录，请检查本地存储', 'error');
+    });
+    return () => { disposed = true; };
+  }, [refresh, toast]);
 
   // —— 任务启动：选目标 → runDownloadJob ——
   const startTask = useCallback(
@@ -229,7 +259,7 @@ export function DownloadManager({ isOpen, onClose }: { isOpen: boolean; onClose:
       }
       return;
     }
-    if (entry.status === 'completed' || pickingTargets.current.has(entry.id)) return;
+    if (entry.status === 'completed' || entry.desktopRecoveryBlocked || pickingTargets.current.has(entry.id)) return;
     if (queuedTargets.current.has(entry.id)) {
       scheduleNext();
       return;
@@ -308,7 +338,7 @@ export function DownloadManager({ isOpen, onClose }: { isOpen: boolean; onClose:
         </div>
         <p className="text-xs text-faint">
           保存能力：{capability === 'memory' ? '内存聚合（上限 500 MiB）' : '磁盘直写（边下边存）'}
-          {capability === 'native' ? ' · 同次运行可暂停和继续' : chunkCache ? ' · 支持断点续传' : ' · 当前环境无断点缓存（需 HTTPS 访问）'} ·
+          {capability === 'native' ? ' · 重启后继续未完成的下载时需重新选择保存位置' : chunkCache ? ' · 支持断点续传' : ' · 当前环境无断点缓存（需 HTTPS 访问）'} ·
           同时进行 {Math.min(running.current.size, MAX_CONCURRENT_DOWNLOADS)}/{MAX_CONCURRENT_DOWNLOADS} 个任务
         </p>
         {tasks.length === 0 && (
@@ -321,6 +351,9 @@ export function DownloadManager({ isOpen, onClose }: { isOpen: boolean; onClose:
             <div className="flex items-start justify-between gap-2">
               <div className="min-w-0">
                 <p className="text-sm text-content truncate">{t.title}</p>
+                {t.desktopRecoveryBlocked && (
+                  <p className="text-xs text-faint">无法确认原文件已完整保存。请检查原保存位置，必要时创建新任务。</p>
+                )}
                 <p className="text-xs text-faint">
                   {t.format.toUpperCase()} · {statusLabel[t.status]}
                   {t.status === 'downloading' && t.total > 0 ? ` · ${t.finished}/${t.total} 分片` : ''}
@@ -336,7 +369,7 @@ export function DownloadManager({ isOpen, onClose }: { isOpen: boolean; onClose:
                     暂停
                   </button>
                 )}
-                {(t.status === 'paused' || t.status === 'waiting' || t.status === 'error') && (
+                {!t.desktopRecoveryBlocked && (t.status === 'paused' || t.status === 'waiting' || t.status === 'error') && (
                   <button
                     type="button"
                     className="px-2 py-1 rounded bg-chip hover:bg-hover text-xs text-content transition-colors"

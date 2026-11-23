@@ -16,10 +16,9 @@ interface SearchBody {
 /** 搜索结果短缓存：同一关键词 + 同一组源在 TTL 内直接返回（播放页返回搜索页等场景） */
 const SEARCH_CACHE_TTL = 60 * 1000;
 
-/** 缓存键：wd + 成人过滤 + 排序后的源地址集合（直接用完整字符串，避免哈希碰撞串缓存） */
+/** 源标识、名称及成人标记写入响应，配置改变后需使用新的缓存条目。 */
 function searchCacheKey(wd: string, sources: SourceConfig[], filterAdult: boolean): string {
-  const urls = sources.map((s) => s.url.replace(/\/+$/, '')).sort().join('|');
-  return `search:${wd}\n${filterAdult ? 1 : 0}\n${urls}`;
+  return `search:${JSON.stringify([wd, filterAdult, sources.map((s) => [s.key, s.name, s.url, s.isAdult])])}`;
 }
 
 /**
@@ -56,13 +55,14 @@ function isTimeoutError(err: unknown): boolean {
  * 整源受 SEARCH_SOURCE_TIMEOUT_MS 总死线约束。
  * 旧版在浏览器里打满 N 个请求（暴露用户 IP、无法缓存、超时失控），现全部上移。
  */
-async function searchSource(source: SourceConfig, wd: string): Promise<SourceSearchOutcome> {
+async function searchSource(source: SourceConfig, wd: string, requestSignal: AbortSignal): Promise<SourceSearchOutcome> {
   const start = Date.now();
   const finish = (outcome: Omit<SourceSearchOutcome, 'ms'>): SourceSearchOutcome => ({
     ...outcome,
     ms: Date.now() - start,
   });
 
+  if (requestSignal.aborted) return finish({ sourceKey: source.key, ok: false, list: [], error: '搜索已取消' });
   if (!/^https?:\/\//.test(source.url || '')) {
     return finish({ sourceKey: source.key, ok: false, list: [], error: '无效的源地址' });
   }
@@ -74,6 +74,7 @@ async function searchSource(source: SourceConfig, wd: string): Promise<SourceSea
 
   // 死线到点中断该源所有在途分页请求，避免后台继续空耗
   const controller = new AbortController();
+  const signal = AbortSignal.any([requestSignal, controller.signal]);
   let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
   const deadline = new Promise<SourceSearchOutcome>((resolve) => {
     deadlineTimer = setTimeout(() => {
@@ -92,11 +93,15 @@ async function searchSource(source: SourceConfig, wd: string): Promise<SourceSea
 
   const base = source.url.replace(/\/+$/, '');
   const fetchPage = async (page: number) => {
-    const api = `${base}?ac=videolist&wd=${encodeURIComponent(wd)}&pg=${page}`;
-    const res = await fetchUpstream(api, {
+    signal.throwIfAborted();
+    const api = new URL(base);
+    api.searchParams.set('ac', 'videolist');
+    api.searchParams.set('wd', wd);
+    api.searchParams.set('pg', String(page));
+    const res = await fetchUpstream(api.href, {
       timeoutMs: 8000,
       headers: cmsRequestHeaders(),
-      signal: controller.signal,
+      signal,
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return res.json();
@@ -199,7 +204,7 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: '请求格式错误' }, { status: 400 });
   }
 
-  const wd = (body.wd || '').trim();
+  const wd = typeof body?.wd === 'string' ? body.wd.trim() : '';
   if (!wd || wd.length > 100) {
     return NextResponse.json({ error: '搜索关键词无效' }, { status: 400 });
   }
@@ -207,6 +212,9 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: '请至少选择一个点播源' }, { status: 400 });
   }
   const sources = body.sources.slice(0, 50);
+  if (sources.some((source) => !source || typeof source.url !== 'string')) {
+    return NextResponse.json({ error: '无效的点播源配置' }, { status: 400 });
+  }
   const filterAdult = body.filterAdult !== false;
 
   const cacheKey = searchCacheKey(wd, sources, filterAdult);
@@ -224,18 +232,21 @@ export async function POST(req: Request) {
 
   const isStream = new URL(req.url).searchParams.get('stream') === '1';
   if (!isStream) {
-    const outcomes = await Promise.all(sources.map((source) => searchSource(source, wd)));
+    const outcomes = await Promise.all(sources.map((source) => searchSource(source, wd, req.signal)));
+    if (req.signal.aborted) return new Response(null, { status: 499 });
     const payload = aggregateOutcomes(outcomes, wd, filterAdult);
     setCache(cacheKey, payload, SEARCH_CACHE_TTL);
     return NextResponse.json(payload);
   }
 
   const encoder = new TextEncoder();
+  const cancelStream = new AbortController();
+  const requestSignal = AbortSignal.any([req.signal, cancelStream.signal]);
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
       let closed = false;
       const send = (event: SearchStreamEvent) => {
-        if (closed) return;
+        if (closed || requestSignal.aborted) return;
         try {
           controller.enqueue(encoder.encode(JSON.stringify(event) + '\n'));
         } catch {
@@ -247,7 +258,7 @@ export async function POST(req: Request) {
       const outcomes: SourceSearchOutcome[] = new Array(sources.length);
       await Promise.all(
         sources.map(async (source, i) => {
-          const outcome = await searchSource(source, wd);
+          const outcome = await searchSource(source, wd, requestSignal);
           outcomes[i] = outcome;
           // 中间结果与最终结果共用去重和过滤规则，避免无关/成人条目短暂出现在页面上。
           const { list } = aggregateOutcomes([outcome], wd, filterAdult);
@@ -255,13 +266,18 @@ export async function POST(req: Request) {
         })
       );
 
-      const payload = aggregateOutcomes(outcomes, wd, filterAdult);
-      setCache(cacheKey, payload, SEARCH_CACHE_TTL);
-      send({ type: 'done', list: payload.list, failures: payload.failures });
+      if (!requestSignal.aborted) {
+        const payload = aggregateOutcomes(outcomes, wd, filterAdult);
+        setCache(cacheKey, payload, SEARCH_CACHE_TTL);
+        send({ type: 'done', list: payload.list, failures: payload.failures });
+      }
       closed = true;
       try {
         controller.close();
       } catch { /* 已断开 */ }
+    },
+    cancel(reason) {
+      cancelStream.abort(reason);
     },
   });
 

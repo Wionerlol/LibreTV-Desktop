@@ -66,6 +66,7 @@ export interface DownloadTaskEntry {
   finished: number;
   total: number;
   errorNum: number;
+  desktopRecoveryBlocked?: boolean;
   createdAt: number;
   updatedAt: number;
 }

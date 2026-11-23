@@ -6,6 +6,7 @@ const { verifyRuntime } = require('./runtime.cjs');
 const { HOST, PORT, ORIGIN, createDesktopServer } = require('./desktop-server.cjs');
 const { registerDesktopDownloads } = require('./native-downloads.cjs');
 const { waitForSmokeClose } = require('./smoke-control.cjs');
+const { observeRenderer } = require('./renderer-acceptance.cjs');
 
 const smoke = process.argv.find((arg) => /^--libretv-smoke=[a-f0-9]{32}$/.test(arg))?.split('=')[1];
 const profile = smoke
@@ -146,7 +147,7 @@ async function start() {
     },
   });
   desktop.bindWindow(window);
-  closeDownloads = registerDesktopDownloads({ ipcMain, dialog, getWindow: () => window, origin: ORIGIN });
+  closeDownloads = registerDesktopDownloads({ ipcMain, dialog, getWindow: () => window, origin: ORIGIN, profilePath: profile });
   window.on('closed', () => { window = undefined; });
   await desktop.load(window, '/');
   log('renderer-loaded', { route: '/' });
@@ -156,6 +157,7 @@ async function start() {
   }
 
   await smokeRenderer();
+  await observeRenderer(window.webContents, log);
   await desktop.load(window, '/live');
   log('renderer-loaded', { route: '/live' });
   await smokeRenderer();

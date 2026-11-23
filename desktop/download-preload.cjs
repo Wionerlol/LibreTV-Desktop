@@ -10,4 +10,5 @@ contextBridge.exposeInMainWorld('libretvDownloads', {
   },
   finish: (leaseId) => ipcRenderer.invoke('libretv:download:finish', leaseId),
   abort: (leaseId) => ipcRenderer.invoke('libretv:download:abort', leaseId),
+  reconcile: () => ipcRenderer.invoke('libretv:download:reconcile'),
 });

@@ -45,7 +45,7 @@ export async function GET(req: Request) {
     // 详情页根地址：显式 detail 优先，其次 baseUrl 参数，最后用接口地址的 origin 推导
     // （Apple CMS 的详情页通常与接口同域）。脏 URL 会让 new URL 抛错，由外层 catch 兜底
     const detailRoot = (source.detail || baseUrl || new URL(source.url).origin).replace(/\/+$/, '');
-    const cacheKey = `detail:${source.url}|${detailRoot}|${id}`;
+    const cacheKey = `detail:${JSON.stringify([source.url, detailRoot, id, source.key, source.name])}`;
     const cached = getCache<VideoDetail>(cacheKey);
     if (cached) {
       return NextResponse.json(cached);
@@ -60,12 +60,13 @@ export async function GET(req: Request) {
     let resolved: VideoDetail | null = null;
 
     // 1) 标准列表接口
-    const api = `${source.url.replace(/\/+$/, '')}?ac=videolist&ids=${encodeURIComponent(id)}`;
-    const res = await fetchUpstream(api, { timeoutMs: 10000, headers: cmsRequestHeaders() });
+    const api = new URL(source.url.replace(/\/+$/, ''));
+    api.searchParams.set('ac', 'videolist');
+    api.searchParams.set('ids', id);
+    const res = await fetchUpstream(api.href, { timeoutMs: 10000, headers: cmsRequestHeaders(), signal: req.signal });
     if (res.ok) {
-      const data = await res.json();
       try {
-        const detail = parseDetail(data, source);
+        const detail = parseDetail(await res.json(), source);
         if (detail.episodes.length > 0) {
           resolved = detail;
         }
@@ -85,6 +86,7 @@ export async function GET(req: Request) {
       const detailRes = await fetchUpstream(detailUrl, {
         timeoutMs: 10000,
         headers: { 'User-Agent': cmsRequestHeaders()['User-Agent'] },
+        signal: req.signal,
       });
       if (detailRes.ok) {
         const html = await detailRes.text();

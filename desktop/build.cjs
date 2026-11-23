@@ -15,7 +15,10 @@ const sourceInputs = [
   ...moduleInputs, 'public', 'src', 'next.config.ts', 'next-env.d.ts', 'tsconfig.json',
   'eslint.config.mjs', 'postcss.config.mjs', 'tailwind.config.ts', 'vitest.config.ts',
 ];
-const mainInputs = ['main.cjs', 'desktop-server.cjs', 'smoke-control.cjs', 'runtime.cjs', 'native-downloads.cjs', 'download-preload.cjs'];
+const mainInputs = [
+  'main.cjs', 'desktop-server.cjs', 'smoke-control.cjs', 'renderer-acceptance.cjs', 'runtime.cjs',
+  'native-downloads.cjs', 'download-journal.cjs', 'download-preload.cjs',
+];
 const executableName = 'LibreTV Desktop.exe';
 const offline = process.argv.includes('--offline');
 
@@ -74,7 +77,8 @@ function writeRuntimeConfig(source, runtime) {
   const compiled = ts.transpileModule(config, {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true },
   }).outputText;
-  const javascript = compiled + '\nmodule.exports = { ...exports.default, output: undefined, outputFileTracingRoot: __dirname };\n';
+  const javascript = compiled + '\nmodule.exports = { ...exports.default, output: undefined, outputFileTracingRoot: __dirname,\n' +
+    '  experimental: { ...exports.default.experimental, isrFlushToDisk: false } };\n';
   fs.writeFileSync(path.join(source, 'next.config.js'), javascript, { flag: 'wx' });
   fs.copyFileSync(path.join(source, 'next.config.js'), path.join(runtime, 'next.config.js'), fs.constants.COPYFILE_EXCL);
   // Next selects the original TypeScript config when both exist.

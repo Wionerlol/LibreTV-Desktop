@@ -1,10 +1,16 @@
 import type { SaveTarget } from './download-saver';
 
+export interface DesktopDownloadRecovery {
+  taskId: string;
+  status: 'completed' | 'paused_needs_target' | 'needs_reconcile';
+}
+
 interface DesktopDownloadBridge {
   pick(taskId: string, name: string): Promise<{ leaseId: string } | null>;
   write(leaseId: string, data: ArrayBuffer): Promise<void>;
   finish(leaseId: string): Promise<void>;
   abort(leaseId: string): Promise<void>;
+  reconcile?(): Promise<DesktopDownloadRecovery[]>;
 }
 
 export function getDesktopDownloadBridge(): DesktopDownloadBridge | undefined {

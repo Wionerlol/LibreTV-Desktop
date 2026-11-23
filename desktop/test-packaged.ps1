@@ -3,8 +3,11 @@
 param(
     [Parameter(Mandatory)][string] $Executable,
     [ValidateRange(1, 100)][int] $Cycles = 10,
-    [switch] $LegacyStartupOnly
+    [switch] $LegacyStartupOnly,
+    [switch] $RequireRendererChecks
 )
+
+if ($LegacyStartupOnly -and $RequireRendererChecks) { throw 'Renderer checks require a current lifecycle build.' }
 
 $ErrorActionPreference = 'Stop'
 $exe = (Get-Item -LiteralPath $Executable).FullName
@@ -19,6 +22,7 @@ Write-Output "Smoke evidence directory: $runRoot"
     Windows = [Environment]::OSVersion.VersionString
     PowerShell = $PSVersionTable.PSVersion.ToString()
     Mode = if ($LegacyStartupOnly) { 'legacy-startup-only' } else { 'file-v1-lifecycle' }
+    RequireRendererChecks = [bool]$RequireRendererChecks
 }) | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $runRoot 'run.json') -Encoding UTF8
 
 $processes = [Collections.Generic.List[System.Diagnostics.Process]]::new()
@@ -28,6 +32,7 @@ $planned = if ($LegacyStartupOnly) { @('legacy-startup') } else {
     @(1..$Cycles | ForEach-Object { "normal-$_" }) +
         @('second-instance', 'port-conflict', 'force-kill-restart', 'missing-runtime-config')
 }
+if ($RequireRendererChecks) { $planned += 'renderer-compatibility' }
 $case = 'setup'
 $main = $null
 
@@ -267,6 +272,28 @@ try {
     Assert-Observed (($events | Where-Object stage -eq 'boot-failed').code -eq 'RUNTIME_ASSETS' -and $events.stage -notcontains 'owned-listener') 'Missing configuration was not detected before serving'
     Assert-Released $main.Id
     Record-Pass $main.Id 'Missing JavaScript config detected before binding'
+
+    if ($RequireRendererChecks) {
+        $case = 'renderer-compatibility'
+        $main = $null
+        $id = [guid]::NewGuid().ToString('N')
+        $main = Start-Smoke $id
+        $events = Wait-Smoke $main $id
+        $observations = @($events | Where-Object stage -eq 'renderer-acceptance')
+        Assert-Observed ($observations.Count -eq 1) 'Expected one renderer acceptance report'
+        foreach ($check in @('rsc', 'bundled-range', 'blob-worker', 'persistent-profile')) {
+            $matches = @($observations[0].checks | Where-Object name -eq $check)
+            Assert-Observed ($matches.Count -eq 1 -and $matches[0].passed -eq $true) "Renderer check failed: $check"
+        }
+        Assert-Observed (!(($observations[0].checks | Where-Object name -eq 'persistent-profile').existing)) 'Unique smoke profile already contained marker'
+        Assert-NormalExit $main $id
+        $main = Start-Smoke $id
+        $events = Wait-Smoke $main $id
+        $marker = ($events | Where-Object stage -eq 'renderer-acceptance').checks | Where-Object name -eq 'persistent-profile'
+        Assert-Observed ($marker.passed -eq $true -and $marker.existing -eq $true) 'Same profile lost its renderer storage marker after restart'
+        Assert-NormalExit $main $id
+        Record-Pass $main.Id 'RSC, bundled Range, blob Worker and persistent renderer profile verified'
+    }
 } catch {
     $observed = $_.Exception.Message
     $status = if ($observed.StartsWith('ENVIRONMENT_BLOCKED:')) { 'ENVIRONMENT_BLOCKED' } else { 'FAIL' }
