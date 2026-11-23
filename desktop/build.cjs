@@ -13,14 +13,24 @@ const evidence = path.join(repo, 'artifacts', 'validation');
 const moduleInputs = ['package.json', 'package-lock.json'];
 const sourceInputs = [
   ...moduleInputs, 'public', 'src', 'next.config.ts', 'next-env.d.ts', 'tsconfig.json',
-  'eslint.config.mjs', 'postcss.config.mjs', 'tailwind.config.ts',
+  'eslint.config.mjs', 'postcss.config.mjs', 'tailwind.config.ts', 'vitest.config.ts',
 ];
-const mainInputs = ['main.cjs', 'preview-server.cjs', 'runtime.cjs'];
+const mainInputs = ['main.cjs', 'desktop-server.cjs', 'smoke-control.cjs', 'runtime.cjs', 'native-downloads.cjs', 'download-preload.cjs'];
 const executableName = 'LibreTV Desktop.exe';
 const offline = process.argv.includes('--offline');
 
 function sha256(file) {
   return createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+}
+
+function inputTreeSha256(root) {
+  const hash = createHash('sha256');
+  const files = fs.readdirSync(root, { recursive: true, withFileTypes: true })
+    .filter((entry) => entry.isFile())
+    .map((entry) => path.relative(root, path.join(entry.parentPath, entry.name)).split(path.sep).join('/'))
+    .sort();
+  for (const file of files) hash.update(file + '\0' + sha256(path.join(root, file)) + '\n');
+  return hash.digest('hex');
 }
 
 function json(file) {
@@ -122,6 +132,8 @@ async function packageDesktop() {
   for (const file of mainInputs) copyInput(path.join(__dirname, file), path.join(desktop, file));
   copyInput(path.join(repo, 'LICENSE'), path.join(runtime, 'LICENSE'));
 
+  const applicationSourceSha256 = inputTreeSha256(source);
+  const packagingScriptSha256 = sha256(__filename);
   const env = { ...process.env, NEXT_TELEMETRY_DISABLED: '1' };
   for (const key of ['DOCKER_BUILD', 'NODE_ENV', 'PASSWORD', 'PROXY_SECRET', 'DEFAULT_SOURCES',
     'DEFAULT_LIVE_SOURCES', 'DEFAULT_SUBSCRIPTIONS', 'FALLBACK_CORS_PROXY']) delete env[key];
@@ -143,6 +155,8 @@ async function packageDesktop() {
   const pkg = json(path.join(runtime, 'package.json'));
   const manifest = {
     commit: gitHead(),
+    applicationSourceSha256,
+    packagingScriptSha256,
     version: pkg.version,
     buildId: fs.readFileSync(path.join(runtime, '.next', 'BUILD_ID'), 'utf8').trim(),
     platform: process.platform,

@@ -1,12 +1,13 @@
-const { app, BrowserWindow, dialog, Menu } = require('electron');
+const { app, BrowserWindow, dialog, Menu, session, ipcMain } = require('electron');
 const { randomBytes } = require('node:crypto');
 const { appendFileSync, mkdirSync } = require('node:fs');
 const path = require('node:path');
 const { verifyRuntime } = require('./runtime.cjs');
-const { HOST, PORT, ORIGIN, createPreviewServer } = require('./preview-server.cjs');
+const { HOST, PORT, ORIGIN, createDesktopServer } = require('./desktop-server.cjs');
+const { registerDesktopDownloads } = require('./native-downloads.cjs');
+const { waitForSmokeClose } = require('./smoke-control.cjs');
 
 const smoke = process.argv.find((arg) => /^--libretv-smoke=[a-f0-9]{32}$/.test(arg))?.split('=')[1];
-const holdSmokeWindow = smoke && process.argv.includes('--libretv-smoke-hold');
 const profile = smoke
   ? path.join(app.getPath('temp'), 'LibreTVDesktop-smoke', smoke)
   : path.join(app.getPath('appData'), 'LibreTVDesktop');
@@ -14,6 +15,7 @@ const sessionPath = path.join(profile, 'Session');
 const partition = 'persist:libretv-desktop-v1';
 let window;
 let listener;
+let closeDownloads;
 let nextApp;
 let logPath;
 let shuttingDown = false;
@@ -40,6 +42,7 @@ function configureNext() {
   ]) {
     delete process.env[name];
   }
+  return process.env.PASSWORD;
 }
 
 async function listen(server) {
@@ -66,7 +69,7 @@ async function shutdown() {
       resolve();
     }, 4_000);
   });
-  await Promise.race([Promise.allSettled([drain, nextApp?.close()]), limit]);
+  await Promise.race([Promise.allSettled([drain, nextApp?.close(), closeDownloads?.()]), limit]);
   clearTimeout(timer);
   log('shutdown', { listenerClosed: !listener?.listening });
   shutdownFinished = true;
@@ -80,8 +83,12 @@ async function smokeRenderer() {
     "const status = await fetch('/api/status', { cache: 'no-store' });" +
     "const state = await status.json();" +
     "const auth = await fetch('/api/auth', { cache: 'no-store' });" +
+    "const authState = await auth.json();" +
     "const secured = await fetch('/api/live/playlist', { cache: 'no-store' });" +
-    "return { status: status.status, auth: auth.status, secured: secured.status," +
+    "const search = await fetch('/api/search', { method: 'POST', headers: { 'Content-Type': 'application/json' }," +
+    "  body: JSON.stringify({ wd: 'Desktop smoke', sources: [] }) });" +
+    "return { status: status.status, auth: auth.status, secured: secured.status, search: search.status," +
+    " authVerified: authState.verified === true," +
     " passwordRequired: state.passwordRequired === true, verified: state.verified === true," +
     " scripts: performance.getEntriesByType('resource').filter((entry) =>" +
     "  entry.name.startsWith(location.origin + '/_next/static/') && entry.initiatorType === 'script').length," +
@@ -89,8 +96,8 @@ async function smokeRenderer() {
     " isolated: typeof require === 'undefined' && typeof process === 'undefined' };" +
     "})()");
   log('smoke-renderer', observed);
-  if (observed.status !== 200 || observed.auth !== 200 || observed.secured !== 401 ||
-      !observed.passwordRequired || observed.verified || !observed.isolated ||
+  if (observed.status !== 200 || observed.auth !== 200 || observed.secured !== 400 || observed.search !== 400 ||
+      !observed.passwordRequired || !observed.verified || !observed.authVerified || !observed.isolated ||
       !observed.scripts || !observed.stylesheets) {
     throw Object.assign(new Error('Packaged renderer smoke check failed'), { code: 'RENDERER_SMOKE' });
   }
@@ -99,10 +106,10 @@ async function smokeRenderer() {
 async function start() {
   const runtime = path.join(process.resourcesPath, 'libretv-runtime');
   const { manifest, runtimeRequire } = verifyRuntime(runtime);
-  configureNext();
+  const password = configureNext();
 
-  const preview = createPreviewServer();
-  listener = preview.server;
+  const desktop = createDesktopServer();
+  listener = desktop.server;
   await listen(listener);
   log('owned-listener', { origin: ORIGIN });
 
@@ -110,7 +117,7 @@ async function start() {
   nextApp = runtimeRequire('next')({ dev: false, dir: runtime, hostname: HOST, port: PORT });
   await nextApp.prepare();
   if (shuttingDown) return;
-  preview.enable(nextApp.getRequestHandler());
+  desktop.enable(nextApp.getRequestHandler());
   log('next-prepared', {
     buildId: manifest.buildId, commit: manifest.commit, next: manifest.next,
     electron: process.versions.electron, node: process.versions.node, arch: process.arch,
@@ -118,6 +125,14 @@ async function start() {
 
   app.setAppUserModelId('org.libretv.desktop');
   Menu.setApplicationMenu(null);
+  const appSession = session.fromPartition(partition);
+  try {
+    await desktop.bootstrap(appSession, password);
+  } catch (cause) {
+    throw Object.assign(new Error('Desktop auth bootstrap failed', { cause }), { code: 'DESKTOP_AUTH' });
+  }
+  if (shuttingDown) return;
+  log('desktop-auth-ready');
   window = new BrowserWindow({
     title: 'LibreTV Desktop',
     icon: path.join(runtime, 'public', 'favicon.ico'),
@@ -125,15 +140,15 @@ async function start() {
     height: 840,
     show: false,
     webPreferences: {
-      partition, nodeIntegration: false, contextIsolation: true, sandbox: true,
+      preload: path.join(__dirname, 'download-preload.cjs'),
+      session: appSession, nodeIntegration: false, contextIsolation: true, sandbox: true,
       webSecurity: true, devTools: false, webviewTag: false,
     },
   });
-  preview.bindWindow(window, (resourceType) => {
-    if (smoke) log('request-denied', { resourceType });
-  });
+  desktop.bindWindow(window);
+  closeDownloads = registerDesktopDownloads({ ipcMain, dialog, getWindow: () => window, origin: ORIGIN });
   window.on('closed', () => { window = undefined; });
-  await window.loadURL(ORIGIN + '/');
+  await desktop.load(window, '/');
   log('renderer-loaded', { route: '/' });
   if (!smoke) {
     window.show();
@@ -141,11 +156,13 @@ async function start() {
   }
 
   await smokeRenderer();
-  await window.loadURL(ORIGIN + '/live');
+  await desktop.load(window, '/live');
   log('renderer-loaded', { route: '/live' });
   await smokeRenderer();
-  log('smoke-ready');
-  if (!holdSmokeWindow) setTimeout(() => window?.close(), 3_000);
+  log('smoke-ready', { control: 'file-v1' });
+  await waitForSmokeClose(profile);
+  log('smoke-close-requested');
+  window?.close();
 }
 
 try {
@@ -156,7 +173,7 @@ try {
     app.quit();
   } else {
     logPath = path.join(profile, 'startup-' + Date.now() + '-' + process.pid + '.jsonl');
-    log('starting', { preview: true });
+    log('starting');
     app.on('second-instance', () => {
       log('second-instance');
       if (window && (!smoke || window.isVisible())) {
@@ -171,7 +188,8 @@ try {
       if (!shuttingDown) void shutdown();
     });
     app.whenReady().then(start).catch((error) => {
-      const code = ['EADDRINUSE', 'RUNTIME_ASSETS', 'RENDERER_SMOKE'].includes(error.code) ? error.code : 'STARTUP';
+      const known = ['EADDRINUSE', 'RUNTIME_ASSETS', 'DESKTOP_AUTH', 'RENDERER_SMOKE', 'SMOKE_CONTROL', 'SMOKE_CONTROL_TIMEOUT'];
+      const code = known.includes(error.code) ? error.code : 'STARTUP';
       exitCode = 1;
       log('boot-failed', { code });
       if (!smoke) {
@@ -179,6 +197,8 @@ try {
           ? '端口 17888 已被占用。请关闭占用它的程序后重试。'
           : code === 'RUNTIME_ASSETS'
             ? '桌面运行资源不完整。请重新解压完整的应用文件夹。'
+            : code === 'DESKTOP_AUTH'
+              ? '桌面登录初始化失败。请查看应用配置目录中的启动日志。'
             : 'LibreTV Desktop 无法启动。请查看应用配置目录中的启动日志。';
         dialog.showErrorBox('LibreTV Desktop', message);
       }

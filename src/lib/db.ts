@@ -227,42 +227,96 @@ export async function exportConfig(): Promise<string> {
   });
 }
 
-export async function importConfig(content: string): Promise<void> {
+interface ConfigImportResult {
+  historyImported: number;
+  historySkipped: number;
+  invalidHistoryRows: number;
+}
+
+function historyIdentifier(value: unknown): string | undefined {
+  if (typeof value === 'string' && value.trim()) return value;
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+}
+
+function historyNumber(value: unknown, fallback = 0): number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : fallback;
+}
+
+function normalizeHistoryRow(row: unknown): HistoryEntry | undefined {
+  if (row === null || typeof row !== 'object' || Array.isArray(row)) return;
+  const item = row as Record<string, unknown>;
+  const sourceKey = historyIdentifier(item.sourceKey) ?? historyIdentifier(item.sourceCode) ?? historyIdentifier(item.sourceName);
+  const vodId = historyIdentifier(item.vodId) ?? historyIdentifier(item.vod_id);
+  if (!sourceKey || !vodId) return;
+
+  return {
+    id: `${sourceKey}_${vodId}`,
+    sourceKey,
+    vodId,
+    ...(typeof item.sourceUrl === 'string' ? { sourceUrl: item.sourceUrl } : {}),
+    ...(typeof item.pic === 'string' ? { pic: item.pic } : {}),
+    title: typeof item.title === 'string' && item.title ? item.title : '未知视频',
+    episodeIndex: historyNumber(item.episodeIndex),
+    totalEpisodes: historyNumber(item.totalEpisodes, Array.isArray(item.episodes) ? item.episodes.length : 0),
+    playbackPosition: historyNumber(item.playbackPosition),
+    duration: historyNumber(item.duration),
+    timestamp: historyNumber(item.timestamp),
+  };
+}
+
+export async function importConfig(content: string): Promise<ConfigImportResult> {
   const config = JSON.parse(content) as {
     name?: string;
-    data?: Record<string, string>;
+    data?: Record<string, unknown>;
   };
-  if (config.name !== 'LibreTV-Settings') throw new Error('配置文件格式不正确');
+  if (config?.name !== 'LibreTV-Settings') throw new Error('配置文件格式不正确');
   const data = config.data || {};
+  const settings = data[PERSIST_KEY];
+  const history = data['viewingHistory'];
+  const rows: unknown = typeof history === 'string' ? JSON.parse(history) : history;
+  if (rows !== undefined && !Array.isArray(rows)) throw new Error('观看历史格式不正确');
 
-  if (typeof data[PERSIST_KEY] === 'string') {
+  function writeSettings() {
+    if (typeof settings !== 'string') return;
     // 关键：先 flush 节流缓冲中的旧状态再写导入配置，否则缓冲会在
     // 之后 flush 时用导入前的旧状态覆盖刚写入的配置（导入静默丢失）
     flushPendingPersist();
-    localStorage.setItem(PERSIST_KEY, data[PERSIST_KEY]);
+    localStorage.setItem(PERSIST_KEY, settings);
   }
 
-  if (typeof data['viewingHistory'] === 'string') {
-    // 兼容旧版历史结构（含全集 URL 列表），只迁移定位信息
-    const legacy = JSON.parse(data['viewingHistory']) as Record<string, unknown>[];
-    for (const item of legacy.slice(0, MAX_HISTORY)) {
-      const sourceKey = String(item.sourceCode || item.sourceName || '');
-      const vodId = String(item.vod_id || '');
-      const title = String(item.title || '未知视频');
-      if (!sourceKey || !vodId) continue;
-      const totalEpisodes = Array.isArray(item.episodes) ? item.episodes.length : 0;
-      await upsertHistory({
-        sourceKey,
-        vodId,
-        title,
-        episodeIndex: typeof item.episodeIndex === 'number' ? item.episodeIndex : 0,
-        totalEpisodes,
-        playbackPosition: typeof item.playbackPosition === 'number' ? item.playbackPosition : 0,
-        duration: typeof item.duration === 'number' ? item.duration : 0,
-        timestamp: typeof item.timestamp === 'number' ? item.timestamp : Date.now(),
-      });
-    }
+  if (!rows?.length) {
+    writeSettings();
+    return { historyImported: 0, historySkipped: 0, invalidHistoryRows: 0 };
   }
+
+  let invalidHistoryRows = 0;
+  const incoming = new Map<string, HistoryEntry>();
+  for (const row of rows) {
+    const entry = normalizeHistoryRow(row);
+    if (!entry) {
+      invalidHistoryRows++;
+      continue;
+    }
+    const previous = incoming.get(entry.id);
+    if (!previous || entry.timestamp > previous.timestamp) incoming.set(entry.id, entry);
+  }
+
+  const historyImported = await db.transaction('rw', db.history, async () => {
+    const current = new Map((await db.history.toArray()).map((entry) => [entry.id, entry]));
+    let available = MAX_HISTORY - current.size;
+    const accepted: HistoryEntry[] = [];
+    // 优先导入最新记录，保留本机同键的更新记录且不为导入项淘汰现有历史。
+    for (const entry of [...incoming.values()].sort((a, b) => b.timestamp - a.timestamp)) {
+      const existing = current.get(entry.id);
+      if (existing ? existing.timestamp >= entry.timestamp : available <= 0) continue;
+      accepted.push({ ...existing, ...entry });
+      if (!existing) available--;
+    }
+    if (accepted.length > 0) await db.history.bulkPut(accepted);
+    writeSettings();
+    return accepted.length;
+  });
+  return { historyImported, historySkipped: rows.length - historyImported, invalidHistoryRows };
 }
 
 export type { SourceConfig };

@@ -2,20 +2,34 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string] $Executable,
-    [ValidateRange(1, 100)][int] $Cycles = 10
+    [ValidateRange(1, 100)][int] $Cycles = 10,
+    [switch] $LegacyStartupOnly
 )
 
 $ErrorActionPreference = 'Stop'
 $exe = (Get-Item -LiteralPath $Executable).FullName
 $validation = Join-Path (Split-Path -Parent $PSScriptRoot) 'artifacts\validation'
-$runRoot = Join-Path $validation ('p1-smoke-' + [guid]::NewGuid().ToString('N'))
+$runKind = if ($LegacyStartupOnly) { 'p1-legacy-startup-' } else { 'desktop-lifecycle-' }
+$runRoot = Join-Path $validation ($runKind + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $runRoot | Out-Null
 Write-Output "Smoke evidence directory: $runRoot"
+([pscustomobject]@{
+    Executable = $exe
+    Sha256 = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+    Windows = [Environment]::OSVersion.VersionString
+    PowerShell = $PSVersionTable.PSVersion.ToString()
+    Mode = if ($LegacyStartupOnly) { 'legacy-startup-only' } else { 'file-v1-lifecycle' }
+}) | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $runRoot 'run.json') -Encoding UTF8
 
 $processes = [Collections.Generic.List[System.Diagnostics.Process]]::new()
 $results = [Collections.Generic.List[object]]::new()
 $snapshots = [Collections.Generic.List[object]]::new()
+$planned = if ($LegacyStartupOnly) { @('legacy-startup') } else {
+    @(1..$Cycles | ForEach-Object { "normal-$_" }) +
+        @('second-instance', 'port-conflict', 'force-kill-restart', 'missing-runtime-config')
+}
 $case = 'setup'
+$main = $null
 
 function Assert-Observed([bool] $Passed, [string] $Message) {
     if (!$Passed) { throw $Message }
@@ -30,7 +44,14 @@ function Get-Listeners {
 }
 
 function Get-Tree([int] $RootId) {
-    $records = Get-CimInstance -ClassName Win32_Process -Property ProcessId, ParentProcessId, Name
+    try {
+        $records = Get-CimInstance -ClassName Win32_Process -Property ProcessId, ParentProcessId, Name
+    } catch [Microsoft.Management.Infrastructure.CimException] {
+        if ($_.Exception.NativeErrorCode -eq 'AccessDenied') {
+            throw [InvalidOperationException]::new('ENVIRONMENT_BLOCKED: Windows denied CIM process-tree enumeration.', $_.Exception)
+        }
+        throw
+    }
     $members = [Collections.Generic.HashSet[int]]::new()
     $queue = [Collections.Generic.Queue[int]]::new()
     [void]$members.Add($RootId)
@@ -46,8 +67,12 @@ function Get-Tree([int] $RootId) {
     $records | Where-Object { $members.Contains([int]$_.ProcessId) }
 }
 
+function Get-ProfilePath([string] $ProfileId) {
+    Join-Path $runRoot "LibreTVDesktop-smoke\$ProfileId"
+}
+
 function Get-Events([string] $ProfileId, [int] $RootId) {
-    $profilePath = Join-Path $runRoot "LibreTVDesktop-smoke\$ProfileId"
+    $profilePath = Get-ProfilePath $ProfileId
     if (!(Test-Path -LiteralPath $profilePath)) { return }
     $files = Get-ChildItem -LiteralPath $profilePath -Filter "startup-*-$RootId.jsonl" -File
     foreach ($file in $files) {
@@ -59,9 +84,8 @@ function Get-Events([string] $ProfileId, [int] $RootId) {
     }
 }
 
-function Start-Smoke([string] $ProfileId, [string] $Binary = $exe, [switch] $Hold) {
+function Start-Smoke([string] $ProfileId, [string] $Binary = $exe) {
     $arguments = @("--libretv-smoke=$ProfileId")
-    if ($Hold) { $arguments += '--libretv-smoke-hold' }
     $process = Start-Process -FilePath $Binary -ArgumentList $arguments -WorkingDirectory $runRoot -WindowStyle Hidden -PassThru
     $processes.Add($process)
     return $process
@@ -71,9 +95,19 @@ function Wait-Smoke([System.Diagnostics.Process] $Process, [string] $ProfileId) 
     $clock = [Diagnostics.Stopwatch]::StartNew()
     while ($clock.Elapsed.TotalSeconds -lt 30) {
         $events = @(Get-Events $ProfileId $Process.Id)
-        if ($events.stage -contains 'smoke-ready') { return $events }
+        $ready = $events | Where-Object stage -eq 'smoke-ready' | Select-Object -Last 1
+        if ($ready) {
+            if ($LegacyStartupOnly) {
+                Assert-Observed (!$ready.control) 'Use lifecycle mode for an executable implementing file-v1.'
+            } else {
+                Assert-Observed ($ready.control -eq 'file-v1') 'Executable did not report lifecycle control file-v1. Use -LegacyStartupOnly for the immutable baseline.'
+                Assert-Observed (!$Process.HasExited) 'Smoke process already exited after signaling ready.'
+            }
+            return $events
+        }
         if ($Process.HasExited) {
-            throw "Smoke process $($Process.Id) exited with $($Process.ExitCode) before ready. Events: $($events.stage -join ', ')"
+            $code = '0x{0:X8}' -f [int]$Process.ExitCode
+            throw "Smoke process $($Process.Id) exited with $($Process.ExitCode) ($code) before ready. Events: $($events.stage -join ', ')"
         }
         Start-Sleep -Milliseconds 100
     }
@@ -94,9 +128,20 @@ function Assert-Running([System.Diagnostics.Process] $Process, [object[]] $Event
     Assert-Observed ((@($Events | Where-Object stage -eq 'renderer-loaded').route -join ',') -eq '/,/live') 'Both packaged pages must load'
     $renderer = @($Events | Where-Object stage -eq 'smoke-renderer')
     Assert-Observed ($renderer.Count -eq 2 -and @($renderer | Where-Object {
-        $_.status -eq 200 -and $_.auth -eq 200 -and $_.secured -eq 401 -and $_.isolated -and $_.scripts -gt 0 -and $_.stylesheets -gt 0
+        $_.status -eq 200 -and $_.auth -eq 200 -and $_.secured -eq 400 -and $_.search -eq 400 -and
+        $_.passwordRequired -eq $true -and $_.verified -eq $true -and $_.authVerified -eq $true -and
+        $_.isolated -eq $true -and $_.scripts -gt 0 -and $_.stylesheets -gt 0
     }).Count -eq 2) 'Renderer API, auth or static asset check did not pass'
-    $anonymous = Invoke-WebRequest -Uri 'http://127.0.0.1:17888/api/status' -NoProxy -TimeoutSec 2 -SkipHttpErrorCheck
+    try {
+        $anonymous = Invoke-WebRequest -Uri 'http://127.0.0.1:17888/api/status' -NoProxy -TimeoutSec 2 -SkipHttpErrorCheck
+    } catch {
+        for ($cause = $_.Exception; $cause; $cause = $cause.InnerException) {
+            if ($cause -is [Net.Sockets.SocketException] -and $cause.SocketErrorCode -eq [Net.Sockets.SocketError]::AccessDenied) {
+                throw [InvalidOperationException]::new('ENVIRONMENT_BLOCKED: Windows denied the loopback validation client.', $_.Exception)
+            }
+        }
+        throw
+    }
     Assert-Observed ([int]$anonymous.StatusCode -eq 403) 'External caller received a non-403 status'
 }
 
@@ -110,8 +155,13 @@ function Assert-Released([int] $MainId) {
 }
 
 function Assert-NormalExit([System.Diagnostics.Process] $Process, [string] $ProfileId) {
+    Assert-Observed (!$Process.HasExited) 'Smoke process exited before the close request'
+    $signal = Join-Path (Get-ProfilePath $ProfileId) "smoke-close-$($Process.Id).signal"
+    $marker = [IO.File]::Open($signal, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write)
+    $marker.Dispose()
     Assert-Observed ($Process.WaitForExit(15000) -and $Process.ExitCode -eq 0) 'Normal close did not return exit 0'
     $events = @(Get-Events $ProfileId $Process.Id)
+    Assert-Observed ($events.stage -contains 'smoke-close-requested') 'Application did not acknowledge the controller close request'
     Assert-Observed ($events.stage -notcontains 'shutdown-deadline' -and ($events | Where-Object stage -eq 'shutdown').listenerClosed -eq $true) 'Application did not report a graceful listener close'
     Assert-Released $Process.Id
 }
@@ -131,8 +181,25 @@ try {
     Assert-Observed (!(Get-Command node.exe -CommandType Application -ErrorAction SilentlyContinue)) 'System Node still appears on the test PATH'
     Assert-Observed (@(Get-Listeners).Count -eq 0) 'Port 17888 is occupied before testing'
 
+    if ($LegacyStartupOnly) {
+        $case = 'legacy-startup'
+        $id = [guid]::NewGuid().ToString('N')
+        $main = Start-Smoke $id
+        $events = Wait-Smoke $main $id
+        $renderer = @($events | Where-Object stage -eq 'smoke-renderer')
+        Assert-Observed ($renderer.Count -eq 2 -and @($renderer | Where-Object {
+            $_.status -eq 200 -and $_.auth -eq 200 -and $_.secured -eq 401 -and
+            $_.passwordRequired -eq $true -and $_.verified -eq $false -and $_.isolated -eq $true -and
+            $_.scripts -gt 0 -and $_.stylesheets -gt 0
+        }).Count -eq 2) 'Legacy renderer startup observations did not match the baseline'
+        Record-Pass $main.Id 'Legacy renderer startup only. Lifecycle and authenticated business checks were not run.'
+        [void]$main.WaitForExit(10000)
+        return
+    }
+
     foreach ($index in 1..$Cycles) {
         $case = "normal-$index"
+        $main = $null
         $id = [guid]::NewGuid().ToString('N')
         $main = Start-Smoke $id
         $events = Wait-Smoke $main $id
@@ -142,6 +209,7 @@ try {
     }
 
     $case = 'second-instance'
+    $main = $null
     $id = [guid]::NewGuid().ToString('N')
     $main = Start-Smoke $id
     $events = Wait-Smoke $main $id
@@ -153,6 +221,7 @@ try {
     Record-Pass $main.Id 'Second launch signaled the existing app and never owned the listener'
 
     $case = 'port-conflict'
+    $main = $null
     $holder = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 17888)
     $holder.ExclusiveAddressUse = $true
     $holder.Start()
@@ -170,8 +239,9 @@ try {
     }
 
     $case = 'force-kill-restart'
+    $main = $null
     $id = [guid]::NewGuid().ToString('N')
-    $main = Start-Smoke $id -Hold
+    $main = Start-Smoke $id
     $events = Wait-Smoke $main $id
     Assert-Running $main $events
     $crashed = $main.Id
@@ -185,6 +255,7 @@ try {
     Record-Pass $main.Id "Force-stopped PID $crashed, released port/tree and relaunched with the same test profile"
 
     $case = 'missing-runtime-config'
+    $main = $null
     $broken = Join-Path $runRoot 'missing-config-fixture'
     Copy-Item -LiteralPath (Split-Path -Parent $exe) -Destination $broken -Recurse
     $copiedConfig = Join-Path $broken 'resources\libretv-runtime\next.config.js'
@@ -197,15 +268,27 @@ try {
     Assert-Released $main.Id
     Record-Pass $main.Id 'Missing JavaScript config detected before binding'
 } catch {
-    $results.Add([pscustomobject]@{ Case = $case; MainPid = $null; Status = 'FAIL'; Observed = $_.Exception.Message })
+    $observed = $_.Exception.Message
+    $status = if ($observed.StartsWith('ENVIRONMENT_BLOCKED:')) { 'ENVIRONMENT_BLOCKED' } else { 'FAIL' }
+    $results.Add([pscustomobject]@{ Case = $case; MainPid = if ($main) { $main.Id }; Status = $status; Observed = $observed })
+    foreach ($pending in $planned) {
+        if ($results.Case -notcontains $pending) {
+            $results.Add([pscustomobject]@{ Case = $pending; MainPid = $null; Status = 'NOT RUN'; Observed = "Stopped at $case ($status)" })
+        }
+    }
     throw
 } finally {
     foreach ($process in $processes) {
-        if (!$process.HasExited) {
-            $process.Kill()
-            [void]$process.WaitForExit(5000)
+        try {
+            if (!$process.HasExited) {
+                $process.Kill()
+                if (!$process.WaitForExit(5000)) { Write-Warning "Smoke process $($process.Id) did not exit during cleanup." }
+            }
+        } catch {
+            Write-Warning "Unable to stop smoke process $($process.Id) during cleanup."
+        } finally {
+            $process.Dispose()
         }
-        $process.Dispose()
     }
     $results | Export-Csv -LiteralPath (Join-Path $runRoot 'startup-shutdown.csv') -NoTypeInformation -Encoding UTF8
     $snapshots | Export-Csv -LiteralPath (Join-Path $runRoot 'process-tree.csv') -NoTypeInformation -Encoding UTF8

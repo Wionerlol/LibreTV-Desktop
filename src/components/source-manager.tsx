@@ -1104,9 +1104,13 @@ function ConfigIoPanel() {
   const confirmImport = async () => {
     if (!pending) return;
     try {
-      await importConfig(await pending.file.text());
+      const { historyImported, historySkipped, invalidHistoryRows } = await importConfig(await pending.file.text());
       setPending(null);
-      toast('配置导入成功，即将刷新页面', 'success');
+      const historyResult = historyImported || historySkipped
+        ? `。已导入 ${historyImported} 条观看历史，跳过 ${historySkipped} 条`
+        : '';
+      const invalidResult = invalidHistoryRows ? `（${invalidHistoryRows} 条格式无效）` : '';
+      toast(`配置导入完成${historyResult}${invalidResult}，即将刷新页面`, historySkipped ? 'warning' : 'success');
       setTimeout(() => window.location.reload(), 1500);
     } catch (err) {
       toast(err instanceof Error ? err.message : '导入失败', 'error');
@@ -1135,13 +1139,13 @@ function ConfigIoPanel() {
         </label>
       </div>
 
-      {/* 重操作：导入会覆盖全部配置，先确认并展示将导入的内容概要 */}
+      {/* 先展示概要，再确认覆盖配置并合并观看历史。 */}
       <ConfirmDialog
         open={pending !== null}
         danger
-        title="导入配置并覆盖当前数据？"
-        message={pending ? `${pending.summary}。导入后将立即刷新页面，当前设备上的配置与观看历史会被覆盖。` : undefined}
-        confirmLabel="导入并覆盖"
+        title="导入配置与观看历史？"
+        message={pending ? `${pending.summary}。文件中的配置将覆盖当前配置，观看历史会合并并保留较新的记录。完成后将刷新页面。` : undefined}
+        confirmLabel="确认导入"
         onCancel={() => setPending(null)}
         onConfirm={confirmImport}
       />

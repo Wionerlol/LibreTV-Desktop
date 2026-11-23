@@ -142,6 +142,68 @@ function jobOptions(overrides: Partial<DownloadJobOptions> = {}): DownloadJobOpt
 }
 
 describe('runDownloadJob · 源站缺片与存储错误', () => {
+  it('短列表的下载并发不会预留不存在的分片', async () => {
+    stubCaches();
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith('index.m3u8')) return new Response(PLAYLIST, { status: 200 });
+      return new Response(new Uint8Array([Number(url.at(-4))]), { status: 200 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const bytes: number[] = [];
+    const target = jobOptions().target;
+    await runDownloadJob(jobOptions({
+      concurrency: 8,
+      target: { ...target, write: async (data) => { bytes.push(...data); } },
+    }));
+    expect(bytes).toEqual([0, 1, 2]);
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+  });
+
+  it('同一运行中暂停和继续沿用保存目标，不重复请求首个分片', async () => {
+    stubCaches();
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith('index.m3u8')) return new Response(PLAYLIST, { status: 200 });
+      return new Response(new Uint8Array([0x47]), { status: 200 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const pause = new PauseResumeController();
+    const staged = Promise.withResolvers<void>();
+    const target = { ...jobOptions().target, close: vi.fn(async () => {}) };
+    const job = runDownloadJob(jobOptions({
+      pause,
+      target,
+      onProgress(p) {
+        if (p.status === 'downloading' && p.current === 1) {
+          pause.pause();
+          staged.resolve();
+        }
+      },
+    }));
+    await staged.promise;
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(target.close).not.toHaveBeenCalled();
+    pause.resume();
+    await job;
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(target.close).toHaveBeenCalledTimes(1);
+  });
+
+  it('取消处于暂停中的任务会解除等待且不会提交文件', async () => {
+    const abort = new AbortController();
+    const pause = new PauseResumeController();
+    pause.pause();
+    const fetchMock = vi.fn();
+    const target = { ...jobOptions().target, close: vi.fn(async () => {}) };
+    vi.stubGlobal('fetch', fetchMock);
+    const job = runDownloadJob(jobOptions({ pause, signal: abort.signal, target }));
+    abort.abort();
+    await expect(job).rejects.toMatchObject({ name: 'AbortError' });
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(target.close).not.toHaveBeenCalled();
+  });
+
   it('分片 404 视为确定性缺失：不重试、立即失败并提示换源', async () => {
     stubCaches();
     const calls: string[] = [];
