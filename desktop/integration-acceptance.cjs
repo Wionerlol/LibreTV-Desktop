@@ -508,10 +508,12 @@ async function verifyPlaybackFile(base64) {
     video.src = url;
     document.body.append(video);
     return await new Promise((resolve) => {
-      const finish = (passed, code) => resolve({ passed, code, metrics: {
+      const finish = (passed, code, playError) => resolve({ passed, code, metrics: {
         readyState: video.readyState, networkState: video.networkState, mediaError: video.error?.code ?? 0,
         videoWidth: video.videoWidth, currentTimeMs: Math.round(video.currentTime * 1000),
         durationMs: Number.isFinite(video.duration) ? Math.round(video.duration * 1000) : -1,
+        paused: video.paused, seeking: video.seeking, visibility: document.visibilityState,
+        ...(playError && { playError }),
       } });
       let firstFrameTime;
       timer = setTimeout(() => finish(false, 'DOWNLOAD_CHROMIUM_TIMEOUT'), 6000);
@@ -524,7 +526,11 @@ async function verifyPlaybackFile(base64) {
         finish(durationMatches, durationMatches ? undefined : 'DOWNLOAD_CHROMIUM_DURATION_MISMATCH');
       }, 80);
       video.addEventListener('error', () => finish(false, 'DOWNLOAD_CHROMIUM_MEDIA_ERROR'), { once: true });
-      video.play().catch(() => finish(false, 'DOWNLOAD_CHROMIUM_PLAY_REJECTED'));
+      video.play().catch((error) => {
+        const names = ['NotAllowedError', 'AbortError', 'NotSupportedError'];
+        const playError = names.includes(error?.name) ? error.name : 'OtherError';
+        finish(false, 'DOWNLOAD_CHROMIUM_PLAY_REJECTED', playError);
+      });
     });
   } finally {
     clearTimeout(timer);

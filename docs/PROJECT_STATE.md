@@ -4,7 +4,7 @@
 
 ## 第四轮 — Integration Validation & Stabilization
 
-- Windows x64 个人验收修复包 desktop-J49Qmc 构建与包内校验 PASS，源码提交 36937fa4df02c3d31e470cafc07e733ee2855801，EXE SHA-256 f72a5b04154f913641f2e09f7e67beabd07ce49f4cfb8a6a1abbf6e910d88844。MP4 时长修复后的文件通过生产下载器、Windows 写入、FFmpeg 全文件解码及 3 秒定位。新报告区分文件落盘与 Chromium 播放，并保留重启所需的 SHA-256。新包在普通 Windows 的下载 MP4 播放复核及跨重启 SHA-256 对账仍待运行。
+- Windows x64 个人验收修复包 desktop-J49Qmc 构建与包内校验 PASS，源码提交 36937fa4df02c3d31e470cafc07e733ee2855801，EXE SHA-256 f72a5b04154f913641f2e09f7e67beabd07ce49f4cfb8a6a1abbf6e910d88844。MP4 时长修复后的文件通过生产下载器、Windows 写入、FFmpeg 全文件解码及 3 秒定位。新报告区分文件落盘与 Chromium 播放，并保留重启所需的 SHA-256。普通 Windows 实机复验 PASS 的项目包括授权 HLS 播放、下载落盘、历史与进度恢复、下载任务恢复及重启后的输出 SHA-256 对账。实际保存 129,203 字节，SHA-256 与修复后生产下载夹具一致。Chromium 下载后播放复核仍为 FAIL（DOWNLOAD_CHROMIUM_PLAY_REJECTED）。浏览器已读到 160 像素视频和 7.443 秒时长，拒绝类型未记录。
 
 - 普通 Windows 实机运行 `desktop-FVcFgW`。一次正常启停及四项故障场景、自动登录及受保护 API、三例原生全屏、缩短 Profile 后的 Chromium IndexedDB 读写与重启均 PASS。授权合成 HLS 经过 ArtPlayer 实际解码、播放、跳转和暂停，结果 PASS。源导入及搜索到播放页使用隔离夹具，范围为 PARTIAL。
 - 实机下载完成三个分段并保存 129,203 字节的 MP4，下载清单与 SHA-256 一致，FFmpeg 严格全文件解码 PASS。原始验收的 Chromium 文件播放复核仍为 FAIL，独立查出 MP4 轨道时长保留了占位值，呈现 24:51:18.49 的错误时长。重启后历史、播放进度和任务均存在，原探针未执行重启后 SHA 校验，业务重启保持 PARTIAL。
