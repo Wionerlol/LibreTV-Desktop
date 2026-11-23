@@ -6,6 +6,7 @@
 
 - 普通 Windows 桌面自动化实测已产生。第一次预检因 17888 被占用停止，未记录占用者。第二次成功完成十次启停、单实例、端口占用拒绝、强杀恢复、缺资源拒绝、自动登录、匿名拒绝、RSC、Range、Blob Worker 及隔离 Profile 的重启检查。
 - 实机确认新 Profile 首次写入并在重启后保留 22 条个人点播源。三个原生全屏探针 FAIL，合成搜索/详情探针超时，播放及下载 NOT RUN。跨端口 Chromium 请求返回 403，目标收到的请求及凭据头均为零，覆盖范围 PARTIAL。实际生命周期日志仍记录了 Next.js 关闭时的 /api/hot-list AwaiterOnce 异常。
+- 实机反馈后的稳定性修复包 desktop-uoXwHS 已构建并复核。原热榜关停异常在真实 Next 编译产物上复现 HTTP 500。新顺序让同一请求返回 200，4 秒硬退出期限保留。全屏 DOM 取样和搜索卡片探针已修复并通过定向回归。修复包实际 Windows 复跑待执行。
 - 第四轮个人 Windows x64 验收包 desktop-9tgfWM 构建 PASS，源码提交 b7c910d73744535a82aa634c827230f2d5136a09，EXE SHA-256 1d9becafecc3f3489b5e9c3c72629d70865c5c07a34dce7da04b2610df895cfb。原生 Windows 启动工具要求审批，当前托管策略拒绝，Codex 托管环境的原生 Electron 仍为 ENVIRONMENT_BLOCKED。普通桌面实机证据由用户启动统一验收入口取得。
 - 第四轮从 `a6cbabf` 继续。第三轮基线验收包 `desktop-ZxYrB9` 及源码提交 `e7bbbdb771807b4fe05fa92f335e78b8668cca47` 已复核并保留。用户在普通 Windows 桌面实际体验该包，反馈网页全屏可用，原生显示器全屏未进入。
 - 全屏缺陷定位到 Session 的全拒绝权限处理。Electron 44.9.3 通过可信播放主框架的 fullscreen 权限进入原生显示器全屏，继续拒绝自动全屏、子框架和其它权限。点播与直播保留原生与网页两种 ArtPlayer 控件。网关单测 13/13 PASS，实际窗口化、最大化、Esc 和多显示器结果由打包验收单独记录。
