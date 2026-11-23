@@ -1,8 +1,23 @@
 # LibreTV Desktop Project State
 
-项目 LIBRETV-DESKTOP-WIN。基线分支 codex/libretv-desktop。上一轮冻结提交 b51510544abad106af32350c2410a928fcc373c0。方案 B 继续使用，历史 v3 独立审查仍为 BLOCKED / LIMITED。
+项目 LIBRETV-DESKTOP-WIN。基线分支 codex/libretv-desktop。第三轮构建基线为 e7bbbdb771807b4fe05fa92f335e78b8668cca47。方案 B 继续使用，历史 v3 独立审查仍为 BLOCKED / LIMITED。
 
-## 最新证据
+## 第四轮 — Integration Validation & Stabilization
+
+- 第四轮个人 Windows x64 验收包 desktop-9tgfWM 构建 PASS，源码提交 b7c910d73744535a82aa634c827230f2d5136a09，EXE SHA-256 1d9becafecc3f3489b5e9c3c72629d70865c5c07a34dce7da04b2610df895cfb。原生 Windows 启动工具要求审批，当前托管策略拒绝，本轮真实 Electron 为 ENVIRONMENT_BLOCKED。已复用第三轮 raw 记录。
+- 第四轮从 `a6cbabf` 继续。第三轮基线验收包 `desktop-ZxYrB9` 及源码提交 `e7bbbdb771807b4fe05fa92f335e78b8668cca47` 已复核并保留。用户在普通 Windows 桌面实际体验该包，反馈网页全屏可用，原生显示器全屏未进入。
+- 全屏缺陷定位到 Session 的全拒绝权限处理。Electron 44.9.3 通过可信播放主框架的 fullscreen 权限进入原生显示器全屏，继续拒绝自动全屏、子框架和其它权限。点播与直播保留原生与网页两种 ArtPlayer 控件。网关单测 13/13 PASS，实际窗口化、最大化、Esc 和多显示器结果由打包验收单独记录。
+- 用户确认个人使用包内置此前提供的 22 条历史点播源。个人构建使用 `npm.cmd --prefix desktop run build:personal`。首次初始化对 URL 去重并分配稳定标识，现有配置保持优先，停用和删除可持久保存。普通桌面构建、Web/Docker 默认行为及鉴权、SSRF、成人过滤沿用原机制。源站有效性和内容授权仍按实际访问情况判断。
+- 统一验收入口 `desktop/test-integration.ps1`。使用隔离 Profile、临时数据、有权使用的合成媒体、自动报告和证据索引。实际 EXE、Node 夹具与用户人工结果分别归档。
+- 现有产物为 `win-unpacked` 验收目录。单文件 portable EXE 和安装包形式待确认。生产依赖 PostCSS 8.4.31 的构建可达性已确认，已测生产请求未见加载，风险评估仍为 PARTIAL。受保护安装目录、Docker 真实容器、长播与并发下载和其他文件系统结果以本轮验收矩阵为准。
+
+### P7 — Desktop UI/UX Refinement（待确认）
+
+排在 P0–P6 核心验收和主要缺陷修复之后。进入 P7 前提交真实界面截图、主要体验问题和建议方案。整体布局、字体、色彩、留白、卡片、播放器、设置、下载管理和交互反馈待用户确认设计后再实施。
+
+[第四轮证据](../artifacts/validation/round4/summary.md) · [历史第三轮验收矩阵](../artifacts/validation/round3/acceptance-matrix.md)
+
+## 第二轮证据（历史）
 
 - P1 原包在普通 Windows 桌面人工启动 PASS。同一原包的 Codex 自动化启动原始 FAIL 保留，执行环境结论为 ENVIRONMENT_BLOCKED。其余生命周期验收待独立运行。
 - P2 源码包含 Main 内部登录、Session 级请求桥接、所有权绑定准入及媒体出网边界。真实 Next + Windows Node 夹具通过基本登录和准入，真实 Electron renderer、Worker 和媒体请求验证分别记录。
@@ -11,7 +26,7 @@
 
 [第二轮验收索引](../artifacts/validation/round2/manifest.md) · [人工启动与原始日志](../artifacts/validation/round2/p1-manual.md) · [构建和验收脚本](../desktop/README.md)
 
-## 最终验收快照
+## 第二轮验收快照（历史）
 
 - Windows x64 验收包已构建并复核 EXE 与 ASAR 校验值。自动启动首轮仍为 0x80000003，后续真实 GUI 用例受执行环境阻断。
 - 最终包 Next 15.5.29 的真实路由与 Session mock 集成测试通过。Web 483 项回归、TypeScript、lint 和 Windows standalone 构建通过，实际 Docker 容器尚待验证。

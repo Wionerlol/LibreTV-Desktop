@@ -205,14 +205,20 @@ try {
         if ($code -cnotmatch '^[A-Za-z0-9_-]{1,80}$') { $code = $null }
         $metrics = [ordered]@{}
         foreach ($property in $observation.metrics.PSObject.Properties) {
-            if ($property.Name -cmatch '^[A-Za-z][A-Za-z0-9_]{0,79}$' -and
-                $property.Value -is [ValueType] -and $property.Value -isnot [DateTime]) {
+            $numeric = $property.Value -is [ValueType] -and $property.Value -isnot [DateTime]
+            $digest = $property.Name -match 'sha256$' -and [string]$property.Value -cmatch '^[a-fA-F0-9]{64}$'
+            if ($property.Name -cmatch '^[A-Za-z][A-Za-z0-9_]{0,79}$' -and ($numeric -or $digest)) {
                 $metrics[$property.Name] = $property.Value
             }
         }
         $integrationRows.Add([pscustomobject]@{ Check = $name; Status = $status; Code = $code; Metrics = $metrics })
         if ($results[$name].Status -eq 'FAIL' -or ($status -eq 'NOT RUN' -and $results[$name].Status -ne 'NOT RUN')) { continue }
-        Set-Check $name $status 'Recorded by the packaged integration probe.'
+        $detail = [string]$observation.detail
+        if ($status -eq 'FAIL' -or !$detail -or $detail.Length -gt 280 -or $detail -match '[\r\n|]|https?://|[A-Za-z]:\\|[?=&]') {
+            $detail = 'Recorded by the packaged integration probe.'
+            if ($code) { $detail += " ($code)" }
+        }
+        Set-Check $name $status $detail
     }
 
     $fullscreenChecks = @('native-fullscreen-windowed-escape', 'native-fullscreen-maximized-button', 'native-fullscreen-second-display')

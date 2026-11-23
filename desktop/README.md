@@ -23,10 +23,10 @@ npm.cmd --prefix desktop run build
 
 ## Windows 集成验收
 
-先退出当前正在运行的 LibreTV Desktop。在仓库根目录使用普通 Windows PowerShell 7.2+ 执行一次。下面的路径对应已保留的第三轮包，测试其他构建时替换 `-Executable`。
+先退出当前正在运行的 LibreTV Desktop。在仓库根目录使用普通 Windows PowerShell 7.2+ 执行一次。下面的路径对应第四轮个人验收包，测试其他构建时替换 `-Executable`。
 
 ```powershell
-pwsh -NoProfile -File .\desktop\test-integration.ps1 -Executable '.\artifacts\validation\desktop-ZxYrB9\dist\win-unpacked\LibreTV Desktop.exe'
+pwsh -NoProfile -File .\desktop\test-integration.ps1 -Executable '.\artifacts\validation\desktop-9tgfWM\dist\win-unpacked\LibreTV Desktop.exe'
 ```
 
 控制器为每次运行创建独立的 `artifacts/validation/round4/integration-*`。其中的 `acceptance.md` 汇总状态，`run.json` 保存构建身份和结构化结果，`index.md` 指向原始日志、生命周期 CSV、进程树和 Main CPU、工作集、启动时间采样。不需要手工收集这些文件。
@@ -36,3 +36,7 @@ pwsh -NoProfile -File .\desktop\test-integration.ps1 -Executable '.\artifacts\va
 测试使用独立的临时 profile，并从系统 PATH 排除 Node。端口 17888 已被占用时记录阻塞并停止。测试仅关闭自己创建的测试进程。退出码 `0` 表示全部自动检查通过，`1` 表示存在失败，`2` 表示结果未齐或环境阻塞。长时间播放、不同文件系统、受保护安装目录和 Docker 的证据需要独立验证，表中单独列出。
 
 `test-packaged.ps1` 是底层生命周期脚本，可独立执行。P1 旧二进制的原始启动验收使用 `-LegacyStartupOnly`。
+
+## 个人使用构建
+
+本机已有用户提供的历史源 JSON 时，执行 npm.cmd --prefix desktop run build:personal。构建校验并装配被 Git 忽略的 artifacts/fixtures/libretv-historical-sources.json。仅全新 Profile 初始化 22 条源，已有设置、停用和删除保持。普通 build 与 Web/Docker 默认配置不变。
