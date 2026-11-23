@@ -3,6 +3,8 @@ node_modules
 .next
 out
 tsconfig.tsbuildinfo
+artifacts
+desktop
 
 # 版本控制与 CI
 .git
