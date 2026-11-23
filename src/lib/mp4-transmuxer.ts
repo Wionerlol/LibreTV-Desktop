@@ -26,6 +26,17 @@ function writeU32(buf: Uint8Array, off: number, value: number): void {
   buf[off + 3] = value & 0xff;
 }
 
+function durationTicks(seconds: number, timescale: number): number {
+  const ticks = Math.round(seconds * timescale);
+  return ticks > 0 && ticks < UNKNOWN_DURATION ? ticks : 0;
+}
+function patchUnknownDuration(buf: Uint8Array, payload: number, offset: number, end: number, ticks: number): void {
+  const field = payload + offset;
+  if (field + 4 <= end && buf[payload] === 0 && readU32(buf, field) === UNKNOWN_DURATION) {
+    writeU32(buf, field, ticks);
+  }
+}
+
 function boxType(buf: Uint8Array, off: number): string {
   return String.fromCharCode(buf[off], buf[off + 1], buf[off + 2], buf[off + 3]);
 }
@@ -49,16 +60,13 @@ function walkBoxes(
 /**
  * 把 mux.js 初始化段里的「未知时长」哨兵值替换成真实时长。
  *
- * mux.js 的 `moov` 恒为 `mvhd(0xffffffff)`（`trak` 里 `tkhd` 同样），而它的 mvhd
- * timescale 是 90000 —— 于是任何按 mvhd 读时长的播放器/资源管理器都会得到
- * 0xFFFFFFFF / 90000 ≈ 47721.86s ≈ 13:15:21，即「每集下载出来都是 13 小时多」。
- * 与片源无关，是封装层问题，只能在写出 initSegment 前就地回填。
+ * mvhd 和 tkhd 使用电影时间单位，mdhd 使用各音视频轨道的时间单位。
+ * 有的播放器按 mdhd 读取时长，48 kHz 音轨的哨兵值会被解释为近 25 小时。
  *
  * 只处理 version 0（mux.js 实际产物）；version 1 的 8 字节 duration 不改写。
  */
-export function patchInitSegmentDuration(init: Uint8Array, seconds: number): Uint8Array {
-  if (!Number.isFinite(seconds) || seconds <= 0) return init;
-  const ticks = Math.min(Math.round(seconds * MOVIE_TIMESCALE), UNKNOWN_DURATION - 1);
+export function patchInitSegmentDuration(init: Uint8Array, seconds = 0): Uint8Array {
+  const ticks = durationTicks(seconds, MOVIE_TIMESCALE);
   // 复制一份：initSegment 由 mux.js 内部生成，直接改可能污染其复用缓冲
   const out = init.slice();
   walkBoxes(out, 0, out.length, (type, payload, boxEnd) => {
@@ -66,18 +74,24 @@ export function patchInitSegmentDuration(init: Uint8Array, seconds: number): Uin
     walkBoxes(out, payload, boxEnd, (childType, childPayload, childEnd) => {
       if (childType === 'mvhd') {
         // payload: version(1) flags(3) creation(4) modification(4) timescale(4) duration(4)
-        if (out[childPayload] === 0 && childPayload + 20 <= childEnd) {
-          writeU32(out, childPayload + 16, ticks);
-        }
+        patchUnknownDuration(out, childPayload, 16, childEnd, ticks);
         return;
       }
       if (childType !== 'trak') return;
       walkBoxes(out, childPayload, childEnd, (leafType, leafPayload, leafEnd) => {
-        if (leafType !== 'tkhd') return;
-        // payload: version(1) flags(3) creation(4) modification(4) track_ID(4) reserved(4) duration(4)
-        if (out[leafPayload] === 0 && leafPayload + 24 <= leafEnd) {
-          writeU32(out, leafPayload + 20, ticks);
+        if (leafType === 'tkhd') {
+          // payload: version(1) flags(3) creation(4) modification(4) track_ID(4) reserved(4) duration(4)
+          patchUnknownDuration(out, leafPayload, 20, leafEnd, ticks);
+          return;
         }
+        if (leafType !== 'mdia') return;
+        walkBoxes(out, leafPayload, leafEnd, (mediaType, mediaPayload, mediaEnd) => {
+          if (mediaType !== 'mdhd' || mediaPayload + 20 > mediaEnd || out[mediaPayload] !== 0) return;
+          const timescale = readU32(out, mediaPayload + 12);
+          if (timescale === 0) return;
+          const mediaTicks = durationTicks(seconds, timescale);
+          patchUnknownDuration(out, mediaPayload, 16, mediaEnd, mediaTicks);
+        });
       });
     });
   });
@@ -85,7 +99,7 @@ export function patchInitSegmentDuration(init: Uint8Array, seconds: number): Uin
 }
 
 export interface StreamingTransmuxerOptions {
-  /** 整集真实时长（秒）；用于回填 moov 时长，缺省则保留「未知时长」哨兵值 */
+  /** 整集时长（秒）；缺省时写零，播放器从媒体分片推导时长 */
   durationSeconds?: number;
 }
 
@@ -110,9 +124,7 @@ export class StreamingTransmuxer {
       const data: Uint8Array = this.initWritten
         ? media
         : concat(
-            this.durationSeconds
-              ? patchInitSegmentDuration(new Uint8Array(segment.initSegment), this.durationSeconds)
-              : new Uint8Array(segment.initSegment),
+            patchInitSegmentDuration(new Uint8Array(segment.initSegment), this.durationSeconds),
             media
           );
       this.initWritten = true;
@@ -174,7 +186,7 @@ export function transmuxTSToMP4(tsSegments: Uint8Array[], duration?: number): Bl
   transmuxer.on('data', (segment: any) => {
     if (!initWritten) {
       const init = new Uint8Array(segment.initSegment);
-      chunks.push(duration ? patchInitSegmentDuration(init, duration) : init);
+      chunks.push(patchInitSegmentDuration(init, duration));
       initWritten = true;
     }
     chunks.push(new Uint8Array(segment.data));

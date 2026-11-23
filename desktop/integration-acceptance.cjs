@@ -504,13 +504,27 @@ async function verifyPlaybackFile(base64) {
   let interval;
   try {
     video.muted = true;
+    video.playsInline = true;
     video.src = url;
+    document.body.append(video);
     return await new Promise((resolve) => {
-      timer = setTimeout(() => resolve(false), 6000);
+      const finish = (passed, code) => resolve({ passed, code, metrics: {
+        readyState: video.readyState, networkState: video.networkState, mediaError: video.error?.code ?? 0,
+        videoWidth: video.videoWidth, currentTimeMs: Math.round(video.currentTime * 1000),
+        durationMs: Number.isFinite(video.duration) ? Math.round(video.duration * 1000) : -1,
+      } });
+      let firstFrameTime;
+      timer = setTimeout(() => finish(false, 'DOWNLOAD_CHROMIUM_TIMEOUT'), 6000);
       interval = setInterval(() => {
-        if (video.currentTime > 0.15 && video.videoWidth > 0) resolve(true);
+        if (video.readyState < 2 || video.videoWidth === 0) return;
+        if (firstFrameTime === undefined) firstFrameTime = video.currentTime;
+        if (video.currentTime - firstFrameTime < 0.15) return;
+        // The authorized fixture contains six seconds of content.
+        const durationMatches = video.duration >= 5 && video.duration <= 8;
+        finish(durationMatches, durationMatches ? undefined : 'DOWNLOAD_CHROMIUM_DURATION_MISMATCH');
       }, 80);
-      video.play().catch(() => resolve(false));
+      video.addEventListener('error', () => finish(false, 'DOWNLOAD_CHROMIUM_MEDIA_ERROR'), { once: true });
+      video.play().catch(() => finish(false, 'DOWNLOAD_CHROMIUM_PLAY_REJECTED'));
     });
   } finally {
     clearTimeout(timer);
@@ -518,6 +532,7 @@ async function verifyPlaybackFile(base64) {
     video.pause();
     video.removeAttribute('src');
     video.load();
+    video.remove();
     URL.revokeObjectURL(url);
   }
 }
@@ -531,7 +546,7 @@ async function observeBusiness(window, log, { profile, phase, origin, fixture })
   } catch {
     log('integration-check', { name: 'indexeddb', status: 'FAIL', code: 'INDEXEDDB_PROBE_EXECUTION' });
   }
-  const names = phase === 'initial' ? ['preset-initial', 'source-import', 'vod-search', 'media-playback', 'native-download']
+  const names = phase === 'initial' ? ['preset-initial', 'source-import', 'vod-search', 'media-playback', 'native-download', 'downloaded-file-chromium']
     : ['business-persistence', 'preset-restart'];
   let args;
   let observed;
@@ -555,16 +570,26 @@ async function observeBusiness(window, log, { profile, phase, origin, fixture })
       const download = observed.checks.find((check) => check.name === 'native-download');
       if (download?.status === 'PASS') {
         const output = await inspectDownload(profile);
-        const playable = output && await window.webContents.executeJavaScript(
-          '(' + verifyPlaybackFile.toString() + ')(' + JSON.stringify(output.bytes.toString('base64')) + ')', true);
-        if (!playable) {
+        if (!output) {
           download.status = 'FAIL';
+          download.code = 'DOWNLOAD_FILE_UNAVAILABLE';
           observed.observed.download = undefined;
-          download.detail = '下载完成回执存在，输出文件读取或 Chromium 解码未通过';
+          download.detail = '下载完成回执存在，未找到有效的 MP4 输出文件';
         } else {
           observed.observed.downloadSha256 = output.sha256;
           Object.assign(download.metrics, { bytes: output.bytes.length, sha256: output.sha256 });
-          download.detail += '。文件实际读回、计算 SHA-256 并解码。';
+          download.detail += '。文件已读回并计算 SHA-256。';
+          const name = 'downloaded-file-chromium';
+          try {
+            const playback = await window.webContents.executeJavaScript(
+              '(' + verifyPlaybackFile.toString() + ')(' + JSON.stringify(output.bytes.toString('base64')) + ')', true);
+            observed.checks.push({
+              name, status: playback.passed ? 'PASS' : 'FAIL', code: playback.code,
+              detail: 'Chromium 复核已下载 MP4 的视频帧和播放进度', metrics: playback.metrics,
+            });
+          } catch {
+            observed.checks.push({ name, status: 'FAIL', code: 'DOWNLOAD_CHROMIUM_PROBE_EXECUTION' });
+          }
         }
       }
       await fs.writeFile(path.join(profile, 'acceptance-observed.json'), JSON.stringify(observed.observed), { flag: 'wx' });

@@ -62,6 +62,7 @@ $checks = [ordered]@{
     'vod-search' = 'Synthetic VOD search and detail'
     'media-playback' = 'Authorized media playback'
     'native-download' = 'Native download with size and SHA-256'
+    'downloaded-file-chromium' = 'Chromium playback of the downloaded MP4'
     'business-persistence' = 'Business data and task recovery across restart'
     'main-resources' = 'Windows Main startup time, CPU and working set'
     'main-response' = 'Authenticated request timing and Main event loop'
@@ -107,7 +108,7 @@ try {
     $candidate.RuntimeProbe = $members.Contains('integration-acceptance.cjs')
     $hasLifecycle = $members.Contains('smoke-control.cjs')
     if (!$candidate.RuntimeProbe) {
-        foreach ($name in @('credential-canary', 'native-fullscreen', 'indexeddb', 'preset-initial', 'preset-restart', 'source-import', 'vod-search', 'media-playback', 'native-download', 'business-persistence', 'main-response')) {
+        foreach ($name in @('credential-canary', 'native-fullscreen', 'indexeddb', 'preset-initial', 'preset-restart', 'source-import', 'vod-search', 'media-playback', 'native-download', 'downloaded-file-chromium', 'business-persistence', 'main-response')) {
             Set-Check $name 'NOT RUN' 'The selected package does not contain the dedicated integration probe.'
         }
     }
