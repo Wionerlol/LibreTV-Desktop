@@ -123,6 +123,41 @@ function ReadableStreamFromRequest(req) {
   return require('node:stream').Readable.toWeb(req);
 }
 
+test('shutdown waits for an admitted Next handler after the renderer socket and listener close', async (t) => {
+  const started = Promise.withResolvers();
+  const disconnected = Promise.withResolvers();
+  const finish = Promise.withResolvers();
+  const f = await fixture(t, { routes: {
+    async '/api/slow-during-shutdown'(_req, res) {
+      res.once('close', disconnected.resolve);
+      started.resolve();
+      await finish.promise;
+      res.end();
+    },
+  } });
+  if (!f) return;
+
+  const abort = new AbortController();
+  const response = f.invoke(request('/api/slow-during-shutdown', { signal: abort.signal }));
+  let drained = false;
+  try {
+    await started.promise;
+    abort.abort();
+    await disconnected.promise;
+    await new Promise((resolve) => f.bridge.server.close(resolve));
+    assert.equal(f.bridge.server.listening, false);
+    const drain = f.bridge.drain().then(() => { drained = true; });
+    await wait(0);
+    assert.equal(drained, false);
+    finish.resolve();
+    await drain;
+    assert.equal(drained, true);
+    await response;
+  } finally {
+    finish.resolve();
+  }
+});
+
 test('native fullscreen is restricted to the owned watch and live main frames', async (t) => {
   const f = await fixture(t);
   if (!f) return;

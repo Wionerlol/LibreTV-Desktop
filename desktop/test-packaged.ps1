@@ -20,6 +20,8 @@ $runRoot = if ($EvidenceDirectory) { [IO.Path]::GetFullPath($EvidenceDirectory) 
     Join-Path $validation ($runKind + [guid]::NewGuid().ToString('N'))
 }
 New-Item -ItemType Directory -Path $runRoot | Out-Null
+$processOutput = Join-Path $runRoot 'process-output'
+New-Item -ItemType Directory -Path $processOutput | Out-Null
 Write-Output "Smoke evidence directory: $runRoot"
 ([pscustomobject]@{
     Executable = $exe
@@ -128,7 +130,13 @@ function Add-IntegrationFixtures([string] $ProfileId) {
 function Start-Smoke([string] $ProfileId, [string] $Binary = $exe, [string] $IntegrationPhase) {
     $arguments = @("--libretv-smoke=$ProfileId")
     if ($IntegrationPhase -in @('initial', 'restart')) { $arguments += "--libretv-integration=$IntegrationPhase" }
-    $process = Start-Process -FilePath $Binary -ArgumentList $arguments -WorkingDirectory $runRoot -WindowStyle Hidden -PassThru
+    $capture = Join-Path $processOutput ([guid]::NewGuid().ToString('N'))
+    $options = @{
+        FilePath = $Binary; ArgumentList = $arguments; WorkingDirectory = $runRoot; WindowStyle = 'Hidden'; PassThru = $true
+        RedirectStandardOutput = $capture + '.stdout.log'
+        RedirectStandardError = $capture + '.stderr.log'
+    }
+    $process = Start-Process @options
     $processes.Add($process)
     return $process
 }
@@ -237,7 +245,16 @@ try {
     $env:TEMP = $runRoot
     $env:TMP = $runRoot
     Assert-Observed (!(Get-Command node.exe -CommandType Application -ErrorAction SilentlyContinue)) 'System Node still appears on the test PATH'
-    Assert-Observed (@(Get-Listeners).Count -eq 0) 'ENVIRONMENT_BLOCKED: Port 17888 was already occupied before testing.'
+    $listenersAtStart = @(Get-Listeners)
+    if ($listenersAtStart.Count) {
+        $holders = foreach ($listener in $listenersAtStart) {
+            $owner = Get-Process -Id $listener.Owner -ErrorAction SilentlyContinue
+            [pscustomobject]@{ Address = $listener.Address; Port = 17888; Pid = $listener.Owner; ProcessName = $owner.ProcessName }
+        }
+        $holders | ConvertTo-Json -AsArray | Set-Content -LiteralPath (Join-Path $runRoot 'port-preflight.json') -Encoding utf8NoBOM
+        $pids = ($listenersAtStart.Owner | Sort-Object -Unique) -join ', '
+        throw "ENVIRONMENT_BLOCKED: Port 17888 was already occupied before testing (PID $pids)."
+    }
 
     if ($LegacyStartupOnly) {
         $case = 'legacy-startup'

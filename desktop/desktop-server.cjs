@@ -188,6 +188,8 @@ function createDesktopServer({ appHeaderTimeout = 60_000, mediaHeaderTimeout = 3
   const expected = Buffer.from(admission);
   const peers = new Map();
   const admitted = new WeakMap();
+  const activeHandlers = new Set();
+  let draining = false;
   let handleRequest;
   let navigation;
   let cookieUrl;
@@ -218,7 +220,7 @@ function createDesktopServer({ appHeaderTimeout = 60_000, mediaHeaderTimeout = 3
       res.writeHead(405, { 'Cache-Control': 'no-store' }).end();
       return;
     }
-    if (!handleRequest) {
+    if (draining || !handleRequest) {
       res.writeHead(503, { 'Cache-Control': 'no-store' }).end();
       return;
     }
@@ -230,11 +232,16 @@ function createDesktopServer({ appHeaderTimeout = 60_000, mediaHeaderTimeout = 3
       if (req.rawHeaders[i].toLowerCase() === ADMISSION) req.rawHeaders.splice(i, 2);
     }
     res.setHeader('Content-Security-Policy', CSP);
+    // Closing a client socket can leave its async Next handler running.
+    const handled = Promise.resolve().then(() => handleRequest(req, res));
+    activeHandlers.add(handled);
     try {
-      await handleRequest(req, res);
+      await handled;
     } catch {
       if (res.headersSent) res.destroy();
       else res.writeHead(500).end();
+    } finally {
+      activeHandlers.delete(handled);
     }
   });
   server.maxConnections = 128;
@@ -519,7 +526,13 @@ function createDesktopServer({ appHeaderTimeout = 60_000, mediaHeaderTimeout = 3
     }
   }
 
-  return { server, bindWindow, load, bootstrap, enable: (handler) => { handleRequest = handler; } };
+  async function drain() {
+    draining = true;
+    if (server.listening) await new Promise((resolve) => server.close(resolve));
+    await Promise.allSettled(activeHandlers);
+  }
+
+  return { server, bindWindow, load, bootstrap, drain, enable: (handler) => { handleRequest = handler; } };
 }
 
 module.exports = { HOST, PORT, ORIGIN, createDesktopServer };

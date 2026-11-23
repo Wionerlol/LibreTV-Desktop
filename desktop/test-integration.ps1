@@ -43,6 +43,7 @@ function Get-AsarMembers([string] $Path) {
 $statuses = @('PASS', 'FAIL', 'PARTIAL', 'NOT RUN', 'ENVIRONMENT_BLOCKED')
 $checks = [ordered]@{
     'lifecycle' = 'Windows lifecycle and process ownership'
+    'next-shutdown' = 'Next.js shutdown waitUntil diagnostics'
     'autologin' = 'Renderer auto-login and protected API'
     'anonymous-access' = 'Anonymous localhost request denied'
     'rsc' = 'React Server Components'
@@ -52,10 +53,10 @@ $checks = [ordered]@{
     'credential-canary' = 'Cookie and admission credential containment'
     'native-fullscreen' = 'Native display fullscreen and restoration'
     'native-fullscreen-windowed-escape' = 'Windowed native fullscreen and Escape'
-    'native-fullscreen-maximized-button' = 'Maximized native fullscreen and player exit'
+    'native-fullscreen-maximized-button' = 'Maximized native fullscreen and exit button'
     'native-fullscreen-second-display' = 'Native fullscreen on a second display'
     'preset-initial' = 'First-launch desktop VOD presets'
-    'preset-restart' = 'Desktop VOD preset edits persist across restart'
+    'preset-restart' = 'Desktop VOD presets across restart'
     'source-import' = 'VOD source import'
     'vod-search' = 'Synthetic VOD search and detail'
     'media-playback' = 'Authorized media playback'
@@ -90,6 +91,7 @@ $resourceRows = @()
 $integrationRows = [Collections.Generic.List[object]]::new()
 $eventSamples = [Collections.Generic.List[object]]::new()
 $setupError = $null
+$lifecycleLog = $null
 try {
     $exe = (Get-Item -LiteralPath $Executable).FullName
     $candidate.Executable = $exe
@@ -124,7 +126,11 @@ try {
             (!$identity.AppAsarSha256 -and $identity.Executable -ne $exe)) {
             throw 'Recorded lifecycle evidence belongs to a different application.'
         }
+        if ((Split-Path -Leaf $rawRoot) -eq 'lifecycle') {
+            $lifecycleLog = Join-Path (Split-Path -Parent $rawRoot) 'lifecycle.log'
+        }
     } else {
+        $lifecycleLog = Join-Path $runRoot 'lifecycle.log'
         $flags = @('-Executable', $exe, '-Cycles', $Cycles, '-EvidenceDirectory', $rawRoot)
         if (!$hasLifecycle) { $flags += '-LegacyStartupOnly' }
         if ($candidate.RendererProbe -and $hasLifecycle) { $flags += '-RequireRendererChecks' }
@@ -135,7 +141,7 @@ try {
         $pwsh = Join-Path $PSHOME 'pwsh.exe'
         $PSNativeCommandUseErrorActionPreference = $false
         & $pwsh -NoProfile -NonInteractive -File (Join-Path $PSScriptRoot 'test-packaged.ps1') @flags 2>&1 |
-            Tee-Object -FilePath (Join-Path $runRoot 'lifecycle.log')
+            Tee-Object -FilePath $lifecycleLog
         $candidate.LifecycleExitCode = $LASTEXITCODE
     }
 
@@ -143,6 +149,20 @@ try {
     $failures = @($rawRows | Where-Object Status -eq 'FAIL')
     $blocked = @($rawRows | Where-Object Status -eq 'ENVIRONMENT_BLOCKED')
     $normal = @($rawRows | Where-Object { $_.Case -match '^normal-\d+$' -and $_.Status -eq 'PASS' })
+    $processOutput = Join-Path $rawRoot 'process-output'
+    if (Test-Path -LiteralPath $processOutput -PathType Container) {
+        $stderr = @(Get-ChildItem -LiteralPath $processOutput -Filter '*.stderr.log' -File -Attributes '!ReparsePoint')
+        $stdout = @(Get-ChildItem -LiteralPath $processOutput -Filter '*.stdout.log' -File -Attributes '!ReparsePoint')
+        $captured = $stderr + $stdout
+        if ($captured.Count) {
+            $waitUntilErrors = @(Select-String -LiteralPath $captured.FullName -SimpleMatch 'Cannot call waitUntil() on an AwaiterOnce that was already awaited')
+            if ($waitUntilErrors.Count) {
+                Set-Check next-shutdown FAIL "$($waitUntilErrors.Count) AwaiterOnce race messages in captured Electron output."
+            } elseif ($normal.Count -and $stderr.Count -ge $normal.Count -and $stdout.Count -ge $normal.Count) {
+                Set-Check next-shutdown PASS 'The known AwaiterOnce race was absent from the captured Electron output.'
+            }
+        }
+    }
     $needs = @('second-instance', 'port-conflict', 'force-kill-restart', 'missing-runtime-config')
     $verified = @($rawRows | Where-Object { $_.Case -in $needs -and $_.Status -eq 'PASS' })
     $failedLifecycle = @($failures | Where-Object Case -notin @('renderer-compatibility', 'packaged-integration'))
@@ -267,7 +287,13 @@ try {
         '- main-resources.csv — sampled Main ready time, CPU and working set when available.',
         '- LibreTVDesktop-smoke — isolated profile records and application startup diagnostics.'
     )
-    if (!$ReuseEvidence) { $index += '- lifecycle.log — lifecycle runner output.' }
+    if ($lifecycleLog -and (Test-Path -LiteralPath $lifecycleLog -PathType Leaf)) {
+        $index += "- Lifecycle runner output — $lifecycleLog"
+    }
+    $portEvidence = Join-Path $rawRoot 'port-preflight.json'
+    if (Test-Path -LiteralPath $portEvidence -PathType Leaf) { $index += "- Preflight listener owners — $portEvidence" }
+    $processEvidence = Join-Path $rawRoot 'process-output'
+    if (Test-Path -LiteralPath $processEvidence -PathType Container) { $index += "- Electron stdout and stderr — $processEvidence" }
     $index | Set-Content -LiteralPath (Join-Path $runRoot 'index.md') -Encoding utf8NoBOM
     Write-Output "Integration report: $(Join-Path $runRoot 'acceptance.md')"
 }

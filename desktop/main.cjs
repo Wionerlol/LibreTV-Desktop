@@ -20,7 +20,7 @@ const profile = smoke
 const sessionPath = path.join(profile, 'Session');
 const partition = 'persist:libretv-desktop-v1';
 let window;
-let listener;
+let desktop;
 let closeDownloads;
 let nextApp;
 let logPath;
@@ -65,22 +65,24 @@ async function listen(server) {
 
 async function shutdown() {
   shuttingDown = true;
-  const drain = new Promise((resolve) => {
-    if (!listener?.listening) {
-      resolve();
-      return;
-    }
-    listener.close(resolve);
-  });
+  const listener = desktop?.server;
+  let deadlineReached = false;
   let timer;
   const limit = new Promise((resolve) => {
     timer = setTimeout(() => {
+      deadlineReached = true;
       log('shutdown-deadline');
       listener?.closeAllConnections();
       resolve();
     }, 4_000);
   });
-  await Promise.race([Promise.allSettled([drain, nextApp?.close(), closeDownloads?.()]), limit]);
+  // Next seals its background-task awaiter when it closes. Requests still
+  // unwinding after a renderer disconnect must finish before that happens.
+  const closeNext = async () => {
+    await desktop?.drain();
+    if (!deadlineReached) await nextApp?.close();
+  };
+  await Promise.race([Promise.allSettled([closeNext(), closeDownloads?.()]), limit]);
   clearTimeout(timer);
   log('shutdown', { listenerClosed: !listener?.listening });
   shutdownFinished = true;
@@ -156,9 +158,8 @@ async function start() {
   const { manifest, runtimeRequire } = verifyRuntime(runtime);
   const password = configureNext();
 
-  const desktop = createDesktopServer();
-  listener = desktop.server;
-  await listen(listener);
+  desktop = createDesktopServer();
+  await listen(desktop.server);
   log('owned-listener', { origin: ORIGIN });
 
   process.chdir(runtime);

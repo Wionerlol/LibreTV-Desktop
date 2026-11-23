@@ -324,25 +324,32 @@ async function rendererBusiness({ sourceList, media, phase, origin, previous }) 
       return { checks, observed: imported || presets ? { sources: imported, presets } : undefined };
     }
 
+    const searchWait = async (stage, probe) => {
+      try {
+        return await eventually(probe);
+      } catch {
+        throw new Error(stage + '超时（合成搜索请求 ' + hits.search + '，合成详情请求 ' + hits.detail + '）');
+      }
+    };
     const searched = await run('vod-search', async () => {
-      const field = await eventually(() => document.querySelector('input[aria-label="搜索影片"]'));
+      const field = await searchWait('等待搜索框', () => document.querySelector('input[aria-label="搜索影片"]'));
       setText(field, title);
       await sleep(150);
       if (field.form) field.form.requestSubmit();
       else field.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
-      const card = await eventually(() => {
+      const card = await searchWait('等待搜索结果卡片', () => {
         const area = document.querySelector('section[aria-label="搜索结果"]');
-        return area && (button(title, area) || Array.from(area.querySelectorAll('button')).find((item) =>
-          item.getAttribute('aria-label')?.includes(title) || item.textContent.includes(title)));
+        return area && Array.from(area.querySelectorAll('button, [role="button"]')).find((item) =>
+          item.getAttribute('aria-label')?.includes(title) || item.textContent.includes(title));
       });
       card.click();
-      const modal = await eventually(() => Array.from(document.querySelectorAll('[role="dialog"]')).find((item) =>
+      const modal = await searchWait('等待详情对话框', () => Array.from(document.querySelectorAll('[role="dialog"]')).find((item) =>
         item.getAttribute('aria-label')?.includes(title)));
-      const episode = await eventually(() => Array.from(modal.querySelectorAll('button')).find((item) =>
+      const episode = await searchWait('等待合成剧集', () => Array.from(modal.querySelectorAll('button')).find((item) =>
         /^(?:1|第\s*1\s*集|合成第一集)$/.test(item.textContent.trim())));
       if (hits.search === 0 || hits.detail === 0) throw new Error('缺少搜索或详情请求观察');
       episode.click();
-      await eventually(() => location.pathname === '/watch');
+      await searchWait('等待进入播放页', () => location.pathname === '/watch');
       return { searches: hits.search, details: hits.detail };
     }, 'PARTIAL', '真实搜索卡片、详情剧集和进入播放页，应用 API 返回由隔离夹具提供');
 
