@@ -4,7 +4,10 @@
 
 ## 第四轮 — Integration Validation & Stabilization
 
-- 媒体验收包 desktop-FVcFgW 已完成 Windows x64 构建与包内校验。合成媒体通过隔离同源 HTTP 提供，生产下载器与原生写入的 TS、MP4 校验和解码通过。验收 Profile 已缩短并添加 IndexedDB 读写观测。真实 Chromium 媒体、下载及业务存储仍待复跑。
+- Windows x64 个人验收修复包 desktop-J49Qmc 构建与包内校验 PASS，源码提交 36937fa4df02c3d31e470cafc07e733ee2855801，EXE SHA-256 f72a5b04154f913641f2e09f7e67beabd07ce49f4cfb8a6a1abbf6e910d88844。MP4 时长修复后的文件通过生产下载器、Windows 写入、FFmpeg 全文件解码及 3 秒定位。新报告区分文件落盘与 Chromium 播放，并保留重启所需的 SHA-256。新包在普通 Windows 的下载 MP4 播放复核及跨重启 SHA-256 对账仍待运行。
+
+- 普通 Windows 实机运行 `desktop-FVcFgW`。一次正常启停及四项故障场景、自动登录及受保护 API、三例原生全屏、缩短 Profile 后的 Chromium IndexedDB 读写与重启均 PASS。授权合成 HLS 经过 ArtPlayer 实际解码、播放、跳转和暂停，结果 PASS。源导入及搜索到播放页使用隔离夹具，范围为 PARTIAL。
+- 实机下载完成三个分段并保存 129,203 字节的 MP4，下载清单与 SHA-256 一致，FFmpeg 严格全文件解码 PASS。原始验收的 Chromium 文件播放复核仍为 FAIL，独立查出 MP4 轨道时长保留了占位值，呈现 24:51:18.49 的错误时长。重启后历史、播放进度和任务均存在，原探针未执行重启后 SHA 校验，业务重启保持 PARTIAL。
 
 - 普通 Windows 桌面自动化实测已产生。第一次预检因 17888 被占用停止，未记录占用者。第二次成功完成十次启停、单实例、端口占用拒绝、强杀恢复、缺资源拒绝、自动登录、匿名拒绝、RSC、Range、Blob Worker 及隔离 Profile 的重启检查。
 - 实机确认新 Profile 首次写入并在重启后保留 22 条个人点播源。三个原生全屏探针 FAIL，合成搜索/详情探针超时，播放及下载 NOT RUN。跨端口 Chromium 请求返回 403，目标收到的请求及凭据头均为零，覆盖范围 PARTIAL。实际生命周期日志仍记录了 Next.js 关闭时的 /api/hot-list AwaiterOnce 异常。
@@ -20,7 +23,7 @@
 
 排在 P0–P6 核心验收和主要缺陷修复之后。进入 P7 前提交真实界面截图、主要体验问题和建议方案。整体布局、字体、色彩、留白、卡片、播放器、设置、下载管理和交互反馈待用户确认设计后再实施。
 
-[最新稳定性实机复验](../artifacts/validation/round4/stabilization-real-rerun.md) · [真实 Windows 运行结果](../artifacts/validation/round4/real-windows-run.md) · [第四轮证据](../artifacts/validation/round4/summary.md) · [历史第三轮验收矩阵](../artifacts/validation/round3/acceptance-matrix.md)
+[最新实机媒体复验](../artifacts/validation/round4/media-real-rerun.md) · [稳定性实机复验](../artifacts/validation/round4/stabilization-real-rerun.md) · [第四轮证据](../artifacts/validation/round4/summary.md) · [历史第三轮验收矩阵](../artifacts/validation/round3/acceptance-matrix.md)
 
 ## 第二轮证据（历史）
 
