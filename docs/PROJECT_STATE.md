@@ -4,6 +4,8 @@
 
 ## 第四轮 — Integration Validation & Stabilization
 
+- 媒体验收包 desktop-FVcFgW 已完成 Windows x64 构建与包内校验。合成媒体通过隔离同源 HTTP 提供，生产下载器与原生写入的 TS、MP4 校验和解码通过。验收 Profile 已缩短并添加 IndexedDB 读写观测。真实 Chromium 媒体、下载及业务存储仍待复跑。
+
 - 普通 Windows 桌面自动化实测已产生。第一次预检因 17888 被占用停止，未记录占用者。第二次成功完成十次启停、单实例、端口占用拒绝、强杀恢复、缺资源拒绝、自动登录、匿名拒绝、RSC、Range、Blob Worker 及隔离 Profile 的重启检查。
 - 实机确认新 Profile 首次写入并在重启后保留 22 条个人点播源。三个原生全屏探针 FAIL，合成搜索/详情探针超时，播放及下载 NOT RUN。跨端口 Chromium 请求返回 403，目标收到的请求及凭据头均为零，覆盖范围 PARTIAL。实际生命周期日志仍记录了 Next.js 关闭时的 /api/hot-list AwaiterOnce 异常。
 - 实机反馈后的稳定性修复包 desktop-uoXwHS 已构建并复核。原热榜关停异常在真实 Next 编译产物上复现 HTTP 500。新顺序让同一请求返回 200，4 秒硬退出期限保留。全屏 DOM 取样和搜索卡片探针已修复并通过定向回归。普通 Windows 实机复跑通过三次启停、故障场景、关停异常检查和原生全屏三例。设置导入、搜索与详情在合成上游下可靠进入播放页。合成 HLS 播放和原生下载探针仍超时，业务重启验收保持 PARTIAL。

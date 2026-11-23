@@ -14,7 +14,8 @@ if ($LegacyStartupOnly -and ($RequireRendererChecks -or $RunIntegrationChecks)) 
 
 $ErrorActionPreference = 'Stop'
 $exe = (Get-Item -LiteralPath $Executable).FullName
-$validation = Join-Path (Split-Path -Parent $PSScriptRoot) 'artifacts\validation'
+$artifacts = Join-Path (Split-Path -Parent $PSScriptRoot) 'artifacts'
+$validation = Join-Path $artifacts 'validation'
 $runKind = if ($LegacyStartupOnly) { 'p1-legacy-startup-' } else { 'desktop-lifecycle-' }
 $runRoot = if ($EvidenceDirectory) { [IO.Path]::GetFullPath($EvidenceDirectory) } else {
     Join-Path $validation ($runKind + [guid]::NewGuid().ToString('N'))
@@ -22,7 +23,12 @@ $runRoot = if ($EvidenceDirectory) { [IO.Path]::GetFullPath($EvidenceDirectory) 
 New-Item -ItemType Directory -Path $runRoot | Out-Null
 $processOutput = Join-Path $runRoot 'process-output'
 New-Item -ItemType Directory -Path $processOutput | Out-Null
+# Keep Chromium's deeper IndexedDB and CacheStorage paths clear of MAX_PATH.
+$runtimeTemp = Join-Path $artifacts ('smoke\' + [guid]::NewGuid().ToString('N').Substring(0, 12))
+$profileStorageRoot = Join-Path $runtimeTemp 'LibreTVDesktop-smoke'
+New-Item -ItemType Directory -Path $profileStorageRoot | Out-Null
 Write-Output "Smoke evidence directory: $runRoot"
+Write-Output "Smoke profile data directory: $profileStorageRoot"
 ([pscustomobject]@{
     Executable = $exe
     Sha256 = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -31,6 +37,7 @@ Write-Output "Smoke evidence directory: $runRoot"
     Mode = if ($LegacyStartupOnly) { 'legacy-startup-only' } else { 'file-v1-lifecycle' }
     RequireRendererChecks = [bool]$RequireRendererChecks
     RunIntegrationChecks = [bool]$RunIntegrationChecks
+    ProfileStorageRoot = $profileStorageRoot
     AppAsarSha256 = (Get-FileHash -LiteralPath (Join-Path (Split-Path -Parent $exe) 'resources\app.asar') -Algorithm SHA256).Hash.ToLowerInvariant()
 }) | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $runRoot 'run.json') -Encoding UTF8
 
@@ -84,7 +91,19 @@ function Get-Tree([int] $RootId) {
 }
 
 function Get-ProfilePath([string] $ProfileId) {
-    Join-Path $runRoot "LibreTVDesktop-smoke\$ProfileId"
+    Join-Path $profileStorageRoot $ProfileId
+}
+
+function Copy-SmokeStartupLogs {
+    $archive = Join-Path $runRoot 'LibreTVDesktop-smoke'
+    foreach ($profile in (Get-ChildItem -LiteralPath $profileStorageRoot -Directory -Attributes '!ReparsePoint')) {
+        if ($profile.Name -cnotmatch '^[a-f0-9]{32}$') { continue }
+        $logs = @(Get-ChildItem -LiteralPath $profile.FullName -Filter 'startup-*.jsonl' -File -Attributes '!ReparsePoint')
+        if (!$logs.Count) { continue }
+        $destination = Join-Path $archive $profile.Name
+        New-Item -ItemType Directory -Path $destination | Out-Null
+        foreach ($log in $logs) { Copy-Item -LiteralPath $log.FullName -Destination $destination }
+    }
 }
 
 function Get-Events([string] $ProfileId, [int] $RootId) {
@@ -242,8 +261,8 @@ $oldTemp = $env:TEMP
 $oldTmp = $env:TMP
 try {
     $env:Path = "$env:SystemRoot\System32;$env:SystemRoot"
-    $env:TEMP = $runRoot
-    $env:TMP = $runRoot
+    $env:TEMP = $runtimeTemp
+    $env:TMP = $runtimeTemp
     Assert-Observed (!(Get-Command node.exe -CommandType Application -ErrorAction SilentlyContinue)) 'System Node still appears on the test PATH'
     $listenersAtStart = @(Get-Listeners)
     if ($listenersAtStart.Count) {
@@ -390,16 +409,27 @@ try {
     }
     throw
 } finally {
+    $processesExited = $true
     foreach ($process in $processes) {
         try {
             if (!$process.HasExited) {
                 $process.Kill()
-                if (!$process.WaitForExit(5000)) { Write-Warning "Smoke process $($process.Id) did not exit during cleanup." }
+                if (!$process.WaitForExit(5000)) {
+                    $processesExited = $false
+                    Write-Warning "Smoke process $($process.Id) did not exit during cleanup."
+                }
             }
         } catch {
+            $processesExited = $false
             Write-Warning "Unable to stop smoke process $($process.Id) during cleanup."
         } finally {
             $process.Dispose()
+        }
+    }
+    if ($processesExited) {
+        try { Copy-SmokeStartupLogs } catch {
+            Write-Warning "Startup logs could not be archived. Original logs remain under $profileStorageRoot."
+            $results.Add([pscustomobject]@{ Case = 'startup-log-archive'; MainPid = $null; Status = 'FAIL'; Observed = 'Startup log archive failed' })
         }
     }
     $results | Export-Csv -LiteralPath (Join-Path $runRoot 'startup-shutdown.csv') -NoTypeInformation -Encoding UTF8

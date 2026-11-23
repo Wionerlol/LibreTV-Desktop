@@ -50,6 +50,7 @@ $checks = [ordered]@{
     'bundled-range' = 'Packaged Range request'
     'blob-worker' = 'Chromium Blob Worker'
     'persistent-profile' = 'Chromium profile across restart'
+    'indexeddb' = 'Chromium IndexedDB write/read'
     'credential-canary' = 'Cookie and admission credential containment'
     'native-fullscreen' = 'Native display fullscreen and restoration'
     'native-fullscreen-windowed-escape' = 'Windowed native fullscreen and Escape'
@@ -92,6 +93,7 @@ $integrationRows = [Collections.Generic.List[object]]::new()
 $eventSamples = [Collections.Generic.List[object]]::new()
 $setupError = $null
 $lifecycleLog = $null
+$profileStorageRoot = $null
 try {
     $exe = (Get-Item -LiteralPath $Executable).FullName
     $candidate.Executable = $exe
@@ -105,7 +107,7 @@ try {
     $candidate.RuntimeProbe = $members.Contains('integration-acceptance.cjs')
     $hasLifecycle = $members.Contains('smoke-control.cjs')
     if (!$candidate.RuntimeProbe) {
-        foreach ($name in @('credential-canary', 'native-fullscreen', 'preset-initial', 'preset-restart', 'source-import', 'vod-search', 'media-playback', 'native-download', 'business-persistence', 'main-response')) {
+        foreach ($name in @('credential-canary', 'native-fullscreen', 'indexeddb', 'preset-initial', 'preset-restart', 'source-import', 'vod-search', 'media-playback', 'native-download', 'business-persistence', 'main-response')) {
             Set-Check $name 'NOT RUN' 'The selected package does not contain the dedicated integration probe.'
         }
     }
@@ -145,6 +147,8 @@ try {
         $candidate.LifecycleExitCode = $LASTEXITCODE
     }
 
+    $identity = Get-Content -LiteralPath (Join-Path $rawRoot 'run.json') -Raw | ConvertFrom-Json
+    $profileStorageRoot = $identity.ProfileStorageRoot
     $rawRows = @(Import-Csv -LiteralPath (Join-Path $rawRoot 'startup-shutdown.csv'))
     $failures = @($rawRows | Where-Object Status -eq 'FAIL')
     $blocked = @($rawRows | Where-Object Status -eq 'ENVIRONMENT_BLOCKED')
@@ -264,6 +268,7 @@ try {
 } finally {
     $report = [ordered]@{
         Candidate = $candidate; RawEvidence = $rawRoot; SetupError = $setupError
+        ProfileStorageRoot = $profileStorageRoot
         Results = @($results.Values); RawLifecycle = $rawRows; NativeProcessSamples = $resourceRows
         IntegrationProbeSamples = @($integrationRows.ToArray())
     }
@@ -285,8 +290,9 @@ try {
         '- startup-shutdown.csv — individual exit, port and restart results when the launcher ran.',
         '- process-tree.csv — observed Windows process trees when available.',
         '- main-resources.csv — sampled Main ready time, CPU and working set when available.',
-        '- LibreTVDesktop-smoke — isolated profile records and application startup diagnostics.'
+        '- LibreTVDesktop-smoke — application startup diagnostics under the lifecycle evidence directory.'
     )
+    if ($profileStorageRoot) { $index += "- Isolated Chromium profiles and synthetic test outputs — $profileStorageRoot" }
     if ($lifecycleLog -and (Test-Path -LiteralPath $lifecycleLog -PathType Leaf)) {
         $index += "- Lifecycle runner output — $lifecycleLog"
     }
