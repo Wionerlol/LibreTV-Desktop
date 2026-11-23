@@ -21,12 +21,18 @@ npm.cmd --prefix desktop run build
 
 编译和打包先在 Windows 本地临时目录完成，再复制到验收目录。若系统临时目录含有 Webpack 保留字符 `!`，使用 `LIBRETV_DESKTOP_BUILD_TEMP` 指定一个可写的本地目录。
 
-## Windows 生命周期验收
+## Windows 集成验收
 
-PowerShell 7.2+ 支持运行自动测试。把该次构建输出的 EXE 路径传给脚本。
+先退出当前正在运行的 LibreTV Desktop。在仓库根目录使用普通 Windows PowerShell 7.2+ 执行一次。下面的路径对应已保留的第三轮包，测试其他构建时替换 `-Executable`。
 
 ```powershell
-pwsh -NoProfile -File .\desktop\test-packaged.ps1 -Executable 'E:\path\to\win-unpacked\LibreTV Desktop.exe'
+pwsh -NoProfile -File .\desktop\test-integration.ps1 -Executable '.\artifacts\validation\desktop-ZxYrB9\dist\win-unpacked\LibreTV Desktop.exe'
 ```
 
-脚本使用隔离配置目录、后台窗口和 Windows 系统 PATH。它检查打包后的页面和 API、Windows 监听 PID 和进程树、十次正常退出、单实例、端口占用、强制终止后重启，以及缺少运行时配置。测试驱动完成运行中检查后，向隔离 profile 写入当前 PID 的一次性退出信号。旧 P1 二进制可单独使用 -LegacyStartupOnly 验证启动。每次运行生成独立的 `artifacts/validation/p1-smoke-*` 证据目录。
+控制器为每次运行创建独立的 `artifacts/validation/round4/integration-*`。其中的 `acceptance.md` 汇总状态，`run.json` 保存构建身份和结构化结果，`index.md` 指向原始日志、生命周期 CSV、进程树和 Main CPU、工作集、启动时间采样。不需要手工收集这些文件。
+
+控制器识别打包文件中实际存在的探针。第三轮包已有生命周期、自动登录、受保护 API、RSC、Range、Blob Worker 和 profile 重启检查。后续包含专用集成探针的包会在同一份隔离 profile 额外执行初次和重启两阶段。历史源 JSON 和第三轮生成的合成媒体会按固定文件名复制到该测试 profile，缺失数据的用例报告 NOT RUN。可用 `-FixtureDirectory` 指定包含同名合成媒体文件的目录。
+
+测试使用独立的临时 profile，并从系统 PATH 排除 Node。端口 17888 已被占用时记录阻塞并停止。测试仅关闭自己创建的测试进程。退出码 `0` 表示全部自动检查通过，`1` 表示存在失败，`2` 表示结果未齐或环境阻塞。长时间播放、不同文件系统、受保护安装目录和 Docker 的证据需要独立验证，表中单独列出。
+
+`test-packaged.ps1` 是底层生命周期脚本，可独立执行。P1 旧二进制的原始启动验收使用 `-LegacyStartupOnly`。

@@ -18,9 +18,14 @@ const sourceInputs = [
 const mainInputs = [
   'main.cjs', 'desktop-server.cjs', 'smoke-control.cjs', 'renderer-acceptance.cjs', 'runtime.cjs',
   'native-downloads.cjs', 'download-journal.cjs', 'download-preload.cjs',
+  'fullscreen-acceptance.cjs', 'canary-acceptance.cjs', 'integration-acceptance.cjs',
 ];
 const executableName = 'LibreTV Desktop.exe';
 const offline = process.argv.includes('--offline');
+const personalSources = process.argv.includes('--personal-sources');
+const initialSourcesName = 'desktop-initial-sources.json';
+const initialSourcesFixture = 'artifacts/fixtures/libretv-historical-sources.json';
+const initialSourcesSha256 = '2cb60e5b455466ab02811d99217f03f0e65077382502e45a5b0000cad2b81ddd';
 
 function sha256(file) {
   return createHash('sha256').update(fs.readFileSync(file)).digest('hex');
@@ -134,13 +139,21 @@ async function packageDesktop() {
   for (const file of sourceInputs) copyInput(path.join(repo, file), path.join(source, file));
   for (const file of moduleInputs) copyInput(path.join(source, file), path.join(runtime, file));
   for (const file of mainInputs) copyInput(path.join(__dirname, file), path.join(desktop, file));
+  if (personalSources) {
+    const original = path.join(repo, initialSourcesFixture);
+    const staged = path.join(desktop, initialSourcesName);
+    if (!fs.existsSync(original)) throw new Error('Personal build requires ' + initialSourcesFixture);
+    copyInput(original, staged);
+    if (sha256(staged) !== initialSourcesSha256) throw new Error('Personal source fixture SHA-256 does not match the authorized snapshot');
+  }
   copyInput(path.join(repo, 'LICENSE'), path.join(runtime, 'LICENSE'));
 
   const applicationSourceSha256 = inputTreeSha256(source);
   const packagingScriptSha256 = sha256(__filename);
   const env = { ...process.env, NEXT_TELEMETRY_DISABLED: '1' };
   for (const key of ['DOCKER_BUILD', 'NODE_ENV', 'PASSWORD', 'PROXY_SECRET', 'DEFAULT_SOURCES',
-    'DEFAULT_LIVE_SOURCES', 'DEFAULT_SUBSCRIPTIONS', 'FALLBACK_CORS_PROXY']) delete env[key];
+    'DEFAULT_LIVE_SOURCES', 'DEFAULT_SUBSCRIPTIONS', 'FALLBACK_CORS_PROXY',
+    'LIBRETV_DESKTOP_INITIAL_SOURCES']) delete env[key];
   const ci = ['ci', '--no-audit', '--no-fund'];
   if (offline) ci.push('--offline');
   runNpm(source, [...ci, '--include=dev'], env);
@@ -173,7 +186,8 @@ async function packageDesktop() {
     packageSha256: sha256(path.join(runtime, 'package.json')),
     applicationLockSha256: sha256(path.join(runtime, 'package-lock.json')),
     desktopLockSha256: sha256(path.join(__dirname, 'package-lock.json')),
-    inputSha256: Object.fromEntries(mainInputs.map((name) => [name, sha256(path.join(desktop, name))])),
+    inputSha256: Object.fromEntries([...mainInputs, ...(personalSources ? [initialSourcesName] : [])]
+      .map((name) => [name, sha256(path.join(desktop, name))])),
   };
   saveJson(path.join(runtime, 'desktop-build.json'), manifest);
   verifyRuntime(runtime);

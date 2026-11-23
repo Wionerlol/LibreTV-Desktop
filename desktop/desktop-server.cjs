@@ -470,8 +470,17 @@ function createDesktopServer({ appHeaderTimeout = 60_000, mediaHeaderTimeout = 3
   function bindWindow(window) {
     const { webContents } = window;
     if (appSession !== webContents.session) throw new Error('Unexpected desktop session');
-    appSession.setPermissionCheckHandler(() => false);
-    appSession.setPermissionRequestHandler((_contents, _permission, respond) => respond(false));
+    const permitFullscreen = (contents, permission, details) => {
+      if (permission !== 'fullscreen' || contents !== webContents || details?.isMainFrame !== true) return false;
+      const request = urlFor(details.requestingUrl);
+      const page = urlFor(webContents.getURL());
+      return request?.origin === ORIGIN && page?.origin === ORIGIN &&
+        request.pathname === page.pathname && ['/watch', '/live'].includes(request.pathname);
+    };
+    appSession.setPermissionCheckHandler((contents, permission, origin, details) =>
+      isAppUrl(origin) && permitFullscreen(contents, permission, details));
+    appSession.setPermissionRequestHandler((contents, permission, respond, details) =>
+      respond(permitFullscreen(contents, permission, details)));
     appSession.setDevicePermissionHandler(() => false);
     appSession.on('will-download', (event) => event.preventDefault());
     webContents.setWindowOpenHandler(() => ({ action: 'deny' }));

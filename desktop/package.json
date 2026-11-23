@@ -4,7 +4,8 @@
   "private": true,
   "license": "AGPL-3.0-or-later",
   "scripts": {
-    "build": "node build.cjs"
+    "build": "node build.cjs",
+    "build:personal": "node build.cjs --personal-sources"
   },
   "devDependencies": {
     "electron": "44.9.3",

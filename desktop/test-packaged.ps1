@@ -4,16 +4,21 @@ param(
     [Parameter(Mandatory)][string] $Executable,
     [ValidateRange(1, 100)][int] $Cycles = 10,
     [switch] $LegacyStartupOnly,
-    [switch] $RequireRendererChecks
+    [switch] $RequireRendererChecks,
+    [string] $EvidenceDirectory,
+    [switch] $RunIntegrationChecks,
+    [string] $FixtureDirectory
 )
 
-if ($LegacyStartupOnly -and $RequireRendererChecks) { throw 'Renderer checks require a current lifecycle build.' }
+if ($LegacyStartupOnly -and ($RequireRendererChecks -or $RunIntegrationChecks)) { throw 'Renderer checks require a current lifecycle build.' }
 
 $ErrorActionPreference = 'Stop'
 $exe = (Get-Item -LiteralPath $Executable).FullName
 $validation = Join-Path (Split-Path -Parent $PSScriptRoot) 'artifacts\validation'
 $runKind = if ($LegacyStartupOnly) { 'p1-legacy-startup-' } else { 'desktop-lifecycle-' }
-$runRoot = Join-Path $validation ($runKind + [guid]::NewGuid().ToString('N'))
+$runRoot = if ($EvidenceDirectory) { [IO.Path]::GetFullPath($EvidenceDirectory) } else {
+    Join-Path $validation ($runKind + [guid]::NewGuid().ToString('N'))
+}
 New-Item -ItemType Directory -Path $runRoot | Out-Null
 Write-Output "Smoke evidence directory: $runRoot"
 ([pscustomobject]@{
@@ -23,15 +28,19 @@ Write-Output "Smoke evidence directory: $runRoot"
     PowerShell = $PSVersionTable.PSVersion.ToString()
     Mode = if ($LegacyStartupOnly) { 'legacy-startup-only' } else { 'file-v1-lifecycle' }
     RequireRendererChecks = [bool]$RequireRendererChecks
+    RunIntegrationChecks = [bool]$RunIntegrationChecks
+    AppAsarSha256 = (Get-FileHash -LiteralPath (Join-Path (Split-Path -Parent $exe) 'resources\app.asar') -Algorithm SHA256).Hash.ToLowerInvariant()
 }) | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $runRoot 'run.json') -Encoding UTF8
 
 $processes = [Collections.Generic.List[System.Diagnostics.Process]]::new()
 $results = [Collections.Generic.List[object]]::new()
 $snapshots = [Collections.Generic.List[object]]::new()
+$resourceSamples = [Collections.Generic.List[object]]::new()
 $planned = if ($LegacyStartupOnly) { @('legacy-startup') } else {
     @(1..$Cycles | ForEach-Object { "normal-$_" }) +
         @('second-instance', 'port-conflict', 'force-kill-restart', 'missing-runtime-config')
 }
+if ($RunIntegrationChecks) { $planned += 'packaged-integration' }
 if ($RequireRendererChecks) { $planned += 'renderer-compatibility' }
 $case = 'setup'
 $main = $null
@@ -89,16 +98,44 @@ function Get-Events([string] $ProfileId, [int] $RootId) {
     }
 }
 
-function Start-Smoke([string] $ProfileId, [string] $Binary = $exe) {
+function Add-IntegrationFixtures([string] $ProfileId) {
+    $workspace = Split-Path -Parent $PSScriptRoot
+    $destination = Join-Path (Get-ProfilePath $ProfileId) 'acceptance-fixtures'
+    New-Item -ItemType Directory -Path $destination | Out-Null
+    $historical = Join-Path $workspace 'artifacts\fixtures\libretv-historical-sources.json'
+    if (Test-Path -LiteralPath $historical -PathType Leaf) {
+        Copy-Item -LiteralPath $historical -Destination (Join-Path $destination 'sources.json')
+    }
+    $mediaRoot = $FixtureDirectory
+    if (!$mediaRoot) {
+        $previous = Join-Path $workspace 'artifacts\validation\round3\synthetic-media.json'
+        if (Test-Path -LiteralPath $previous -PathType Leaf) {
+            $mediaRoot = (Get-Content -LiteralPath $previous -Raw | ConvertFrom-Json).folder
+        }
+    }
+    if (!$mediaRoot) { return }
+    foreach ($name in @('clip.mp4', 'clip.m3u8', 'clip-000.ts', 'clip-001.ts', 'clip-002.ts')) {
+        $inputFile = Join-Path $mediaRoot $name
+        if (!(Test-Path -LiteralPath $inputFile -PathType Leaf)) { continue }
+        $file = Get-Item -LiteralPath $inputFile
+        if ($file.Attributes -band [IO.FileAttributes]::ReparsePoint -or $file.Length -gt 16MB) {
+            throw "Invalid acceptance fixture: $name"
+        }
+        Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $destination $name)
+    }
+}
+
+function Start-Smoke([string] $ProfileId, [string] $Binary = $exe, [string] $IntegrationPhase) {
     $arguments = @("--libretv-smoke=$ProfileId")
+    if ($IntegrationPhase -in @('initial', 'restart')) { $arguments += "--libretv-integration=$IntegrationPhase" }
     $process = Start-Process -FilePath $Binary -ArgumentList $arguments -WorkingDirectory $runRoot -WindowStyle Hidden -PassThru
     $processes.Add($process)
     return $process
 }
 
-function Wait-Smoke([System.Diagnostics.Process] $Process, [string] $ProfileId) {
+function Wait-Smoke([System.Diagnostics.Process] $Process, [string] $ProfileId, [int] $TimeoutSeconds = 30) {
     $clock = [Diagnostics.Stopwatch]::StartNew()
-    while ($clock.Elapsed.TotalSeconds -lt 30) {
+    while ($clock.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
         $events = @(Get-Events $ProfileId $Process.Id)
         $ready = $events | Where-Object stage -eq 'smoke-ready' | Select-Object -Last 1
         if ($ready) {
@@ -116,10 +153,26 @@ function Wait-Smoke([System.Diagnostics.Process] $Process, [string] $ProfileId) 
         }
         Start-Sleep -Milliseconds 100
     }
-    throw "Smoke process $($Process.Id) did not report ready within 30 seconds."
+    throw "Smoke process $($Process.Id) did not report ready within $TimeoutSeconds seconds."
 }
 
 function Assert-Running([System.Diagnostics.Process] $Process, [object[]] $Events) {
+    try {
+        $Process.Refresh()
+        $ready = $Events | Where-Object stage -eq 'smoke-ready' | Select-Object -Last 1
+        $elapsed = (([DateTimeOffset]$ready.time).UtcDateTime - $Process.StartTime.ToUniversalTime()).TotalMilliseconds
+        $resourceSamples.Add([pscustomobject]@{
+            Case = $case; Pid = $Process.Id; Status = 'PASS'
+            ReadyMs = [math]::Round($elapsed, 1)
+            MainWorkingSetMiB = [math]::Round($Process.WorkingSet64 / 1MB, 2)
+            MainCpuMs = [math]::Round($Process.TotalProcessorTime.TotalMilliseconds, 1)
+        })
+    } catch {
+        $resourceSamples.Add([pscustomobject]@{
+            Case = $case; Pid = $Process.Id; Status = 'NOT RUN'
+            ReadyMs = $null; MainWorkingSetMiB = $null; MainCpuMs = $null
+        })
+    }
     $listeners = @(Get-Listeners)
     Assert-Observed ($listeners.Count -eq 1 -and $listeners[0].Owner -eq $Process.Id -and $listeners[0].Address -eq '127.0.0.1') 'Fixed loopback listener is not owned solely by the Electron Main PID'
     $tree = @(Get-Tree $Process.Id)
@@ -184,7 +237,7 @@ try {
     $env:TEMP = $runRoot
     $env:TMP = $runRoot
     Assert-Observed (!(Get-Command node.exe -CommandType Application -ErrorAction SilentlyContinue)) 'System Node still appears on the test PATH'
-    Assert-Observed (@(Get-Listeners).Count -eq 0) 'Port 17888 is occupied before testing'
+    Assert-Observed (@(Get-Listeners).Count -eq 0) 'ENVIRONMENT_BLOCKED: Port 17888 was already occupied before testing.'
 
     if ($LegacyStartupOnly) {
         $case = 'legacy-startup'
@@ -273,6 +326,21 @@ try {
     Assert-Released $main.Id
     Record-Pass $main.Id 'Missing JavaScript config detected before binding'
 
+    if ($RunIntegrationChecks) {
+        $case = 'packaged-integration'
+        $id = [guid]::NewGuid().ToString('N')
+        Add-IntegrationFixtures $id
+        foreach ($phase in @('initial', 'restart')) {
+            $main = Start-Smoke $id -IntegrationPhase $phase
+            $events = Wait-Smoke $main $id -TimeoutSeconds 120
+            Assert-Running $main $events
+            $completed = @($events | Where-Object { $_.stage -eq 'integration-complete' -and $_.phase -eq $phase })
+            Assert-Observed ($completed.Count -eq 1) "Packaged integration did not complete phase $phase."
+            Assert-NormalExit $main $id
+        }
+        Record-Pass $main.Id 'Both packaged integration phases finished and the smoke profile restarted. Individual outcomes are in application evidence.'
+    }
+
     if ($RequireRendererChecks) {
         $case = 'renderer-compatibility'
         $main = $null
@@ -319,6 +387,7 @@ try {
     }
     $results | Export-Csv -LiteralPath (Join-Path $runRoot 'startup-shutdown.csv') -NoTypeInformation -Encoding UTF8
     $snapshots | Export-Csv -LiteralPath (Join-Path $runRoot 'process-tree.csv') -NoTypeInformation -Encoding UTF8
+    $resourceSamples | Export-Csv -LiteralPath (Join-Path $runRoot 'main-resources.csv') -NoTypeInformation -Encoding UTF8
     $env:Path = $oldPath
     $env:TEMP = $oldTemp
     $env:TMP = $oldTmp

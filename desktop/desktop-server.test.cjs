@@ -86,9 +86,12 @@ async function fixture(t, { serverOptions, routes = {}, beforeLogin } = {}) {
   const cookieCalls = [];
   let savedCookie;
   let stripHeaders;
+  let checkPermission;
+  let requestPermission;
+  let page = ORIGIN + '/';
   const session = Object.assign(new EventEmitter(), {
-    setPermissionCheckHandler() {},
-    setPermissionRequestHandler() {},
+    setPermissionCheckHandler(callback) { checkPermission = callback; },
+    setPermissionRequestHandler(callback) { requestPermission = callback; },
     setDevicePermissionHandler() {},
     webRequest: { onBeforeSendHeaders(callback) { stripHeaders = callback; } },
     protocol: { handle(scheme, handler) { handlers.set(scheme, handler); } },
@@ -105,11 +108,12 @@ async function fixture(t, { serverOptions, routes = {}, beforeLogin } = {}) {
   });
   await bridge.bootstrap(session, fixturePassword);
   const window = { webContents: Object.assign(new EventEmitter(), {
-    session, setWindowOpenHandler() {},
+    session, getURL: () => page, setWindowOpenHandler() {},
   }) };
   bridge.bindWindow(window);
   const invoke = (req) => handlers.get(new URL(req.url).protocol.slice(0, -1))(req);
-  return { bridge, window, invoke, stripHeaders, events, cookieCalls,
+  return { bridge, window, invoke, stripHeaders, events, cookieCalls, checkPermission, requestPermission,
+    setPage: (url) => { page = url; },
     forgetCookie: () => { savedCookie = undefined; },
     tamperCookie: () => { savedCookie = { ...savedCookie, value: fakeCookie.replace(/a$/, 'b') }; },
   };
@@ -118,6 +122,41 @@ async function fixture(t, { serverOptions, routes = {}, beforeLogin } = {}) {
 function ReadableStreamFromRequest(req) {
   return require('node:stream').Readable.toWeb(req);
 }
+
+test('native fullscreen is restricted to the owned watch and live main frames', async (t) => {
+  const f = await fixture(t);
+  if (!f) return;
+  const web = f.window.webContents;
+  const check = (url, { owner = web, permission = 'fullscreen', main = true, origin = ORIGIN } = {}) => {
+    const details = { requestingUrl: url, isMainFrame: main };
+    let granted = null;
+    f.requestPermission(owner, permission, (result) => { granted = result; }, details);
+    return [f.checkPermission(owner, permission, origin, details), granted];
+  };
+  for (const route of ['/watch?v=fixture', '/live?channel=fixture']) {
+    const url = ORIGIN + route;
+    f.setPage(url);
+    assert.deepEqual(check(url), [true, true]);
+    assert.deepEqual(check(url, { main: false }), [false, false]);
+    assert.deepEqual(check(url, { owner: null }), [false, false]);
+    assert.deepEqual(check(url, { owner: { session: web.session } }), [false, false]);
+    for (const permission of ['automatic-fullscreen', 'media', 'geolocation', 'pointerLock', 'keyboardLock']) {
+      assert.deepEqual(check(url, { permission }), [false, false]);
+    }
+    for (const untrusted of [undefined, 'about:blank', 'blob:' + url, 'http://127.0.0.1:17889/live',
+      'http://user@127.0.0.1:17888/live', ORIGIN + '/api/proxy', ORIGIN + '/']) {
+      assert.deepEqual(check(untrusted), [false, false]);
+    }
+    assert.equal(f.checkPermission(web, 'fullscreen', ORIGIN, undefined), false);
+    assert.equal(f.checkPermission(web, 'fullscreen', 'https://example.invalid',
+      { requestingUrl: url, isMainFrame: true }), false);
+  }
+  for (const route of ['/', '/api/status', '/_next/static/test.js']) {
+    const url = ORIGIN + route;
+    f.setPage(url);
+    assert.deepEqual(check(url), [false, false]);
+  }
+});
 
 test('Main bootstraps a scoped HttpOnly cookie and admits only the policy-approved request', async (t) => {
   const f = await fixture(t);

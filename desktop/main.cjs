@@ -1,14 +1,19 @@
-const { app, BrowserWindow, dialog, Menu, session, ipcMain } = require('electron');
+const { app, BrowserWindow, dialog, Menu, session, ipcMain, screen } = require('electron');
+const { monitorEventLoopDelay, performance } = require('node:perf_hooks');
 const { randomBytes } = require('node:crypto');
-const { appendFileSync, mkdirSync } = require('node:fs');
+const { appendFileSync, mkdirSync, existsSync, readFileSync } = require('node:fs');
 const path = require('node:path');
 const { verifyRuntime } = require('./runtime.cjs');
 const { HOST, PORT, ORIGIN, createDesktopServer } = require('./desktop-server.cjs');
 const { registerDesktopDownloads } = require('./native-downloads.cjs');
 const { waitForSmokeClose } = require('./smoke-control.cjs');
 const { observeRenderer } = require('./renderer-acceptance.cjs');
+const { observeFullscreen } = require('./fullscreen-acceptance.cjs');
+const { observeCanary } = require('./canary-acceptance.cjs');
+const { observeBusiness, createIntegrationSaveDialog } = require('./integration-acceptance.cjs');
 
 const smoke = process.argv.find((arg) => /^--libretv-smoke=[a-f0-9]{32}$/.test(arg))?.split('=')[1];
+const integration = smoke && process.argv.find((arg) => /^--libretv-integration=(initial|restart)$/.test(arg))?.split('=')[1];
 const profile = smoke
   ? path.join(app.getPath('temp'), 'LibreTVDesktop-smoke', smoke)
   : path.join(app.getPath('appData'), 'LibreTVDesktop');
@@ -40,8 +45,13 @@ function configureNext() {
   for (const name of [
     'DOCKER_BUILD', 'DEFAULT_SOURCES', 'DEFAULT_LIVE_SOURCES', 'DEFAULT_SUBSCRIPTIONS',
     'DEFAULT_RECOMMEND_SOURCE', 'DEFAULT_IMAGE_MODE', 'FALLBACK_CORS_PROXY',
+    'LIBRETV_DESKTOP_INITIAL_SOURCES',
   ]) {
     delete process.env[name];
+  }
+  const initialSources = path.join(__dirname, 'desktop-initial-sources.json');
+  if (existsSync(initialSources)) {
+    process.env.LIBRETV_DESKTOP_INITIAL_SOURCES = readFileSync(initialSources, 'utf8');
   }
   return process.env.PASSWORD;
 }
@@ -104,6 +114,43 @@ async function smokeRenderer() {
   }
 }
 
+async function observeIntegration(desktop) {
+  const histogram = monitorEventLoopDelay({ resolution: 20 });
+  const started = performance.now();
+  const cpu = process.cpuUsage();
+  histogram.enable();
+  try {
+    if (integration === 'initial') {
+      await observeFullscreen(window, screen, log);
+      await observeCanary(window, log);
+    }
+    await desktop.load(window, '/');
+    await observeBusiness(window, log, {
+      profile, phase: integration, origin: ORIGIN, load: (route) => desktop.load(window, route),
+    });
+  } catch {
+    log('integration-check', { name: 'integration-dispatch', status: 'FAIL', detail: 'Integration probe stopped unexpectedly' });
+  } finally {
+    histogram.disable();
+    const used = process.cpuUsage(cpu);
+    const metrics = {
+      elapsedMs: Math.round(performance.now() - started),
+      cpuMs: Math.round((used.user + used.system) / 1000),
+      rssMiB: Math.round(process.memoryUsage().rss / 1048576),
+      delaySamples: histogram.count,
+    };
+    if (histogram.count) {
+      metrics.p50Ms = Math.round(histogram.percentile(50) / 1e6);
+      metrics.p95Ms = Math.round(histogram.percentile(95) / 1e6);
+      metrics.p99Ms = Math.round(histogram.percentile(99) / 1e6);
+      metrics.maxMs = Math.round(histogram.max / 1e6);
+    }
+    log('integration-check', { name: 'main-response', status: histogram.count ? 'PARTIAL' : 'NOT RUN',
+      detail: 'Integration probe workload. Long playback and concurrent downloads are tracked separately.', metrics });
+    log('integration-complete', { phase: integration });
+  }
+}
+
 async function start() {
   const runtime = path.join(process.resourcesPath, 'libretv-runtime');
   const { manifest, runtimeRequire } = verifyRuntime(runtime);
@@ -147,7 +194,10 @@ async function start() {
     },
   });
   desktop.bindWindow(window);
-  closeDownloads = registerDesktopDownloads({ ipcMain, dialog, getWindow: () => window, origin: ORIGIN, profilePath: profile });
+  closeDownloads = registerDesktopDownloads({
+    ipcMain, dialog: integration === 'initial' ? createIntegrationSaveDialog(profile) : dialog,
+    getWindow: () => window, origin: ORIGIN, profilePath: profile,
+  });
   window.on('closed', () => { window = undefined; });
   await desktop.load(window, '/');
   log('renderer-loaded', { route: '/' });
@@ -161,6 +211,7 @@ async function start() {
   await desktop.load(window, '/live');
   log('renderer-loaded', { route: '/live' });
   await smokeRenderer();
+  if (integration) await observeIntegration(desktop);
   log('smoke-ready', { control: 'file-v1' });
   await waitForSmokeClose(profile);
   log('smoke-close-requested');

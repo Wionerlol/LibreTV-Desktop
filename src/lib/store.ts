@@ -5,7 +5,7 @@ import { createJSONStorage, persist } from 'zustand/middleware';
 import type { QualityEntry, SourceConfig, LiveSourceConfig, SourceSearchOutcome } from './types';
 import { isQualityEntryFresh, mergeQualityEntries, qualityKey } from './quality';
 import { clearLiveProbeResultsDb, loadLiveProbeResults, saveLiveProbeResults } from './db';
-import { PERSIST_KEY, createThrottledStorage } from './persist-storage';
+import { PERSIST_KEY, createThrottledStorage, flushPendingPersist } from './persist-storage';
 
 /**
  * 全局设置（zustand + localStorage 持久化）。
@@ -176,6 +176,9 @@ export interface SourceHealthEntry {
 }
 
 interface AppState extends AppSettings {
+  /** 个人桌面初始源已写入，之后的用户选择优先。 */
+  desktopInitialSourcesApplied?: true;
+  initializeDesktopSources: (sources: SourceConfig[]) => void;
   /** 部署者通过 DEFAULT_SOURCES 环境变量预置的源（服务端下发，不持久化） */
   envSources: SourceConfig[];
   /** 已向用户展示过并自动勾选过的预置源 key（持久化：用户取消勾选后不再反复勾上） */
@@ -281,6 +284,9 @@ function nextCustomKey(apiList: SourceConfig[]): string {
  * 需要在直接写盘前 flush 缓冲，而运行时依赖方向是 store → db，不能反向引用）。
  */
 
+// 在首次 rehydrate 前捕获已有设置，避免启动期间的普通 store 写入干扰判断。
+let desktopSettingsProfileIsNew: boolean | undefined;
+
 export const useAppStore = create<AppState>()(
   persist(
     (set, get) => ({
@@ -311,6 +317,18 @@ export const useAppStore = create<AppState>()(
       imageProxyMode: 'direct',
       imageProxyModeTouched: false,
       customImageProxy: '',
+
+      initializeDesktopSources: (sources) => {
+        const { customAPIs, selectedKeys, yellowFilter, desktopInitialSourcesApplied } = get();
+        if (desktopSettingsProfileIsNew !== true || desktopInitialSourcesApplied ||
+            customAPIs.length > 0 || selectedKeys.length > 0 || sources.length === 0) return;
+        set({
+          desktopInitialSourcesApplied: true,
+          customAPIs: sources,
+          selectedKeys: sources.filter((source) => !(source.isAdult && yellowFilter)).map((source) => source.key),
+        });
+        flushPendingPersist();
+      },
 
       addCustomApi: (api) => {
         const list = get().customAPIs;
@@ -753,6 +771,14 @@ export const useAppStore = create<AppState>()(
       name: PERSIST_KEY,
       // 节流写入：搜索 / 测活等高频 set 不再每次都整份序列化写盘
       storage: createJSONStorage(createThrottledStorage),
+      onRehydrateStorage: () => {
+        if (desktopSettingsProfileIsNew !== undefined) return;
+        try {
+          desktopSettingsProfileIsNew = localStorage.getItem(PERSIST_KEY) === null;
+        } catch {
+          desktopSettingsProfileIsNew = false;
+        }
+      },
       // v1：直播源新增归属字段、最近观看新增 sourceUrl。
       // v2：直播源归属改为多引用（fromSubscription 单值 → fromSubscriptions 数组）。
       // 此前未声明 version 的存量数据会被视为 v0 并走 migrate 补齐。
@@ -785,6 +811,7 @@ export const useAppStore = create<AppState>()(
       // liveProbeResults 体积大且写入频繁，持久化走 IndexedDB（db.ts liveProbe 表），不进 localStorage
       partialize: (s) => ({
         customAPIs: s.customAPIs,
+        desktopInitialSourcesApplied: s.desktopInitialSourcesApplied,
         selectedKeys: s.selectedKeys,
         envKeysSeen: s.envKeysSeen,
         subscriptions: s.subscriptions,
