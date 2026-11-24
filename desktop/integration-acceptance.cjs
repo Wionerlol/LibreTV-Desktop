@@ -500,20 +500,40 @@ async function verifyPlaybackFile(base64) {
   const bytes = Uint8Array.from(atob(base64), (character) => character.charCodeAt(0));
   const video = document.createElement('video');
   const url = URL.createObjectURL(new Blob([bytes], { type: 'video/mp4' }));
+  const started = performance.now();
+  const events = [];
+  const state = () => ({
+    elapsedMs: Math.round(performance.now() - started),
+    readyState: video.readyState, networkState: video.networkState, mediaError: video.error?.code ?? 0,
+    videoWidth: video.videoWidth, currentTimeMs: Math.round(video.currentTime * 1000),
+    durationMs: Number.isFinite(video.duration) ? Math.round(video.duration * 1000) : -1,
+    paused: video.paused, seeking: video.seeking, visibility: document.visibilityState,
+  });
+  const mark = (event) => {
+    if (events.length < 24) {
+      const { elapsedMs, currentTimeMs, readyState, networkState } = state();
+      events.push({ event, elapsedMs, currentTimeMs, readyState, networkState });
+    }
+  };
   let timer;
   let interval;
   try {
     video.muted = true;
     video.playsInline = true;
+    const mediaEvents = [
+      'loadstart', 'durationchange', 'loadedmetadata', 'loadeddata', 'canplay', 'play', 'playing',
+      'waiting', 'stalled', 'suspend', 'seeking', 'seeked', 'timeupdate', 'pause', 'abort', 'error',
+    ];
+    for (const name of mediaEvents) video.addEventListener(name, () => mark(name));
     video.src = url;
     document.body.append(video);
     return await new Promise((resolve) => {
-      const finish = (passed, code, playError) => resolve({ passed, code, metrics: {
-        readyState: video.readyState, networkState: video.networkState, mediaError: video.error?.code ?? 0,
-        videoWidth: video.videoWidth, currentTimeMs: Math.round(video.currentTime * 1000),
-        durationMs: Number.isFinite(video.duration) ? Math.round(video.duration * 1000) : -1,
-        paused: video.paused, seeking: video.seeking, visibility: document.visibilityState,
+      const finish = (passed, code, playError, interruption) => resolve({ passed, code, metrics: {
+        ...state(), events: events.slice(),
+        codecSupport: video.canPlayType('video/mp4; codecs="avc1.42C00A, mp4a.40.2"'),
+        decodedFrames: video.getVideoPlaybackQuality().totalVideoFrames,
         ...(playError && { playError }),
+        ...(interruption && { interruption }),
       } });
       let firstFrameTime;
       timer = setTimeout(() => finish(false, 'DOWNLOAD_CHROMIUM_TIMEOUT'), 6000);
@@ -521,15 +541,23 @@ async function verifyPlaybackFile(base64) {
         if (video.readyState < 2 || video.videoWidth === 0) return;
         if (firstFrameTime === undefined) firstFrameTime = video.currentTime;
         if (video.currentTime - firstFrameTime < 0.15) return;
-        // The authorized fixture contains six seconds of content.
+        // The authorized fixtures contain approximately six seconds of content.
         const durationMatches = video.duration >= 5 && video.duration <= 8;
         finish(durationMatches, durationMatches ? undefined : 'DOWNLOAD_CHROMIUM_DURATION_MISMATCH');
       }, 80);
       video.addEventListener('error', () => finish(false, 'DOWNLOAD_CHROMIUM_MEDIA_ERROR'), { once: true });
-      video.play().catch((error) => {
+      mark('play-request');
+      video.play().then(() => mark('play-resolved'), (error) => {
+        mark('play-rejected');
         const names = ['NotAllowedError', 'AbortError', 'NotSupportedError'];
         const playError = names.includes(error?.name) ? error.name : 'OtherError';
-        finish(false, 'DOWNLOAD_CHROMIUM_PLAY_REJECTED', playError);
+        const message = String(error?.message ?? '');
+        const interruption = playError !== 'AbortError' ? undefined
+          : /a new load request/i.test(message) ? 'NEW_LOAD'
+          : /a call to pause/i.test(message) ? 'PAUSE_CALL'
+          : /removed from the document/i.test(message) ? 'REMOVED'
+          : 'UNCLASSIFIED';
+        finish(false, 'DOWNLOAD_CHROMIUM_PLAY_REJECTED', playError, interruption);
       });
     });
   } finally {
@@ -541,6 +569,64 @@ async function verifyPlaybackFile(base64) {
     video.remove();
     URL.revokeObjectURL(url);
   }
+}
+
+async function probeMp4(window, name, bytes, sha256) {
+  try {
+    const playback = await window.webContents.executeJavaScript(
+      '(' + verifyPlaybackFile.toString() + ')(' + JSON.stringify(bytes.toString('base64')) + ')', true);
+    return {
+      name, status: playback.passed ? 'PASS' : 'FAIL', code: playback.code,
+      detail: 'Chromium 复核 MP4 的视频帧和播放进度',
+      metrics: { ...playback.metrics, bytes: bytes.length, sha256 },
+    };
+  } catch {
+    return { name, status: 'FAIL', code: 'DOWNLOAD_CHROMIUM_PROBE_EXECUTION' };
+  }
+}
+
+async function compareMp4Controls(window, profile, downloadSha256) {
+  const fixtureFolder = path.join(profile, 'acceptance-fixtures');
+  const folder = path.join(fixtureFolder, 'mp4-controls');
+  const samples = [
+    ['mp4-standard-control', 'control-standard.mp4', '87c8e5d1b588953acbae3290c80af547d65bfa774d5539c49e8a4d7005a040d6'],
+    ['mp4-remux-control', 'app-remux.mp4', '59c0e9f51926b19a330d8bf2611ddefdd03f5c51d13bd1e003b15d810a50aa4b'],
+  ];
+  try {
+    const parent = await fs.lstat(fixtureFolder);
+    if (!parent.isDirectory() || parent.isSymbolicLink()) throw new Error('Invalid fixture directory');
+    await fs.lstat(folder);
+  } catch (error) {
+    if (error.code === 'ENOENT') return [];
+    return samples.map(([name]) => ({ name, status: 'FAIL', code: 'MP4_CONTROL_INVALID' }));
+  }
+
+  const readVerified = async (file, expected) => {
+    const bytes = await readContainedFile(folder, file, maxOutputBytes);
+    if (!bytes || bytes.toString('ascii', 4, 8) !== 'ftyp' ||
+        createHash('sha256').update(bytes).digest('hex') !== expected) {
+      throw new Error('MP4 control hash or format mismatch');
+    }
+    return bytes;
+  };
+  const checks = [];
+  for (const [name, file, hash] of samples) {
+    try {
+      const bytes = await readVerified(file, hash);
+      if (name === 'mp4-remux-control') {
+        const reference = 'c21c1e6ff20237682175451d13a626bf76b295fa12a7ad75701a0f54c7862a56';
+        await readVerified('app-download.mp4', reference);
+        if (downloadSha256 !== reference) {
+          checks.push({ name, status: 'NOT RUN', code: 'MP4_REMUX_BASELINE_MISMATCH' });
+          continue;
+        }
+      }
+      checks.push(await probeMp4(window, name, bytes, hash));
+    } catch {
+      checks.push({ name, status: 'FAIL', code: 'MP4_CONTROL_INVALID' });
+    }
+  }
+  return checks;
 }
 
 async function observeBusiness(window, log, { profile, phase, origin, fixture }) {
@@ -585,19 +671,10 @@ async function observeBusiness(window, log, { profile, phase, origin, fixture })
           observed.observed.downloadSha256 = output.sha256;
           Object.assign(download.metrics, { bytes: output.bytes.length, sha256: output.sha256 });
           download.detail += '。文件已读回并计算 SHA-256。';
-          const name = 'downloaded-file-chromium';
-          try {
-            const playback = await window.webContents.executeJavaScript(
-              '(' + verifyPlaybackFile.toString() + ')(' + JSON.stringify(output.bytes.toString('base64')) + ')', true);
-            observed.checks.push({
-              name, status: playback.passed ? 'PASS' : 'FAIL', code: playback.code,
-              detail: 'Chromium 复核已下载 MP4 的视频帧和播放进度', metrics: playback.metrics,
-            });
-          } catch {
-            observed.checks.push({ name, status: 'FAIL', code: 'DOWNLOAD_CHROMIUM_PROBE_EXECUTION' });
-          }
+          observed.checks.push(await probeMp4(window, 'downloaded-file-chromium', output.bytes, output.sha256));
         }
       }
+      observed.checks.push(...await compareMp4Controls(window, profile, observed.observed.downloadSha256));
       await fs.writeFile(path.join(profile, 'acceptance-observed.json'), JSON.stringify(observed.observed), { flag: 'wx' });
     } else if (phase === 'restart' && args.previous?.downloadSha256) {
       const output = await inspectDownload(profile);
