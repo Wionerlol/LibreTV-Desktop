@@ -132,6 +132,8 @@ export interface AuthStatusResponse {
   version: string;
   /** 部署者通过 DEFAULT_SOURCES 环境变量预置的采集站（未配置时为空数组） */
   defaultSources: SourceConfig[];
+  /** 个人桌面构建仅供新配置初始化的本地源列表。 */
+  desktopInitialSources?: SourceConfig[];
   /** 部署者通过 DEFAULT_LIVE_SOURCES 环境变量预置的直播源（未配置时为空数组） */
   defaultLiveSources: LiveSourceConfig[];
   /** 部署者通过 DEFAULT_SUBSCRIPTIONS 环境变量预置的 SourceList 订阅链接（未配置时为空数组） */

@@ -2,25 +2,30 @@
  * 下载文件的保存目标：
  * - Chromium（Edge/Chrome）：showSaveFilePicker 边下边写盘（FS Access API），
  *   必须在**用户手势内**调用（点击处理器的同步栈中）；
- * - 其余环境：内存聚合为 Blob 后触发浏览器下载（>500MB 时让用户确认）。
+ * - 其余环境：在 500 MiB 上限内聚合为 Blob 后触发浏览器下载。
  *
  * 有意不做 StreamSaver（mitm.html + SW 中转）：云平台域名下 SW 注册受限，
  * 复杂度高、收益边际——大文件场景建议直接使用 FS Access 浏览器。
  */
 
+import { desktopSaveTarget, getDesktopDownloadBridge } from './desktop-download-target';
+
 export interface SaveTarget {
-  /** 'fs' = 磁盘直写；'memory' = 内存聚合 */
-  kind: 'fs' | 'memory';
+  kind: 'fs' | 'memory' | 'native';
   write(data: Uint8Array): Promise<void>;
   close(): Promise<void>;
   abort(): Promise<void>;
 }
 
+const MAX_MEMORY_SAVE_BYTES = 500 * 1024 * 1024;
+
 export function supportsFileSystemAccess(): boolean {
-  return typeof window !== 'undefined' && 'showSaveFilePicker' in window;
+  return typeof window !== 'undefined' &&
+    typeof (window as Window & { showSaveFilePicker?: unknown }).showSaveFilePicker === 'function';
 }
 
-export function detectSavingCapability(): 'fs-access' | 'memory' {
+export function detectSavingCapability(): 'fs-access' | 'memory' | 'native' {
+  if (getDesktopDownloadBridge()) return 'native';
   return supportsFileSystemAccess() ? 'fs-access' : 'memory';
 }
 
@@ -30,7 +35,7 @@ export class UserCancelledError extends Error {
   }
 }
 
-function memoryTarget(filename: string, confirmOverBytes = 500 * 1024 * 1024): SaveTarget {
+function memoryTarget(filename: string): SaveTarget {
   const chunks: Uint8Array[] = [];
   let bytes = 0;
   let done = false;
@@ -38,6 +43,7 @@ function memoryTarget(filename: string, confirmOverBytes = 500 * 1024 * 1024): S
     if (done) return;
     done = true;
     const blob = new Blob(chunks.map((c) => c.buffer as ArrayBuffer));
+    chunks.length = 0;
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
@@ -51,13 +57,12 @@ function memoryTarget(filename: string, confirmOverBytes = 500 * 1024 * 1024): S
     kind: 'memory',
     async write(data) {
       if (done) return;
-      bytes += data.byteLength;
-      if (bytes > confirmOverBytes && bytes - data.byteLength <= confirmOverBytes) {
-        if (!window.confirm(`下载体积已超过 ${Math.round(confirmOverBytes / 1024 / 1024)}MB，继续将暂存在内存中，可能导致页面卡顿。是否继续？`)) {
-          throw new Error('用户取消了下载（内存超限）');
-        }
+      if (data.byteLength > MAX_MEMORY_SAVE_BYTES - bytes) {
+        throw new Error('下载超过 500 MiB 内存保存上限，请使用支持磁盘直写的浏览器');
       }
-      chunks.push(data);
+      bytes += data.byteLength;
+      // 只保存视图范围内的字节，避免写出或持有整个底层缓冲区。
+      chunks.push(data.slice());
     },
     async close() {
       flush();
@@ -74,10 +79,19 @@ function memoryTarget(filename: string, confirmOverBytes = 500 * 1024 * 1024): S
  * 因此本函数应在点击处理器里被 await（调用方负责）。
  * 用户取消文件选择器时抛出 UserCancelledError。
  */
-export async function pickSaveTarget(filename: string, estimatedBytes?: number): Promise<SaveTarget> {
+export async function pickSaveTarget(
+  filename: string,
+  { taskId, estimatedBytes }: { taskId?: string; estimatedBytes?: number } = {},
+): Promise<SaveTarget> {
+  const desktop = getDesktopDownloadBridge();
+  if (desktop) {
+    if (!taskId) throw new Error('桌面下载缺少任务编号');
+    const lease = await desktop.pick(taskId, filename);
+    if (!lease) throw new UserCancelledError();
+    return desktopSaveTarget(desktop, lease.leaseId);
+  }
   if (supportsFileSystemAccess()) {
     try {
-      // Safari 会暴露 showSaveFilePicker 之外的旧实现；直接 try/catch 兜底
       const picker = (
         window as unknown as {
           showSaveFilePicker: (opts: {
@@ -85,7 +99,7 @@ export async function pickSaveTarget(filename: string, estimatedBytes?: number):
           }) => Promise<{ createWritable: () => Promise<WritableStream> }>;
         }
       ).showSaveFilePicker;
-      const handle = await picker({ suggestedName: filename });
+      const handle = await picker.call(window, { suggestedName: filename });
       const writable = await handle.createWritable();
       const writer = writable.getWriter();
       return {
@@ -106,13 +120,11 @@ export async function pickSaveTarget(filename: string, estimatedBytes?: number):
       if (err instanceof DOMException && err.name === 'AbortError') {
         throw new UserCancelledError();
       }
-      // 文件选择失败（权限/环境）→ 落到内存聚合
+      throw err;
     }
   }
-  if (estimatedBytes && estimatedBytes > 500 * 1024 * 1024) {
-    if (!window.confirm('该视频体积较大（未提供磁盘直写能力的环境），将暂存在内存中，可能导致页面卡顿。是否继续？')) {
-      throw new UserCancelledError();
-    }
+  if (estimatedBytes && estimatedBytes > MAX_MEMORY_SAVE_BYTES) {
+    throw new Error('下载超过 500 MiB 内存保存上限，请使用支持磁盘直写的浏览器');
   }
   return memoryTarget(filename);
 }

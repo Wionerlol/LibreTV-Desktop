@@ -21,7 +21,7 @@ const MAX_SEGMENT_RETRIES = 3;
 
 export class PauseResumeController {
   private paused = false;
-  private waiters: Array<() => void> = [];
+  private waiters = new Set<() => void>();
 
   pause(): void {
     this.paused = true;
@@ -29,17 +29,30 @@ export class PauseResumeController {
 
   resume(): void {
     this.paused = false;
-    const waiters = this.waiters.splice(0);
-    for (const w of waiters) w();
+    for (const wake of this.waiters) wake();
+    this.waiters.clear();
   }
 
   getPaused(): boolean {
     return this.paused;
   }
 
-  async waitIfPaused(): Promise<void> {
+  async waitIfPaused(signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
     if (!this.paused) return;
-    await new Promise<void>((resolve) => this.waiters.push(resolve));
+    await new Promise<void>((resolve, reject) => {
+      const wake = () => {
+        signal?.removeEventListener('abort', cancel);
+        resolve();
+      };
+      const cancel = () => {
+        this.waiters.delete(wake);
+        reject(signal?.reason);
+      };
+      this.waiters.add(wake);
+      signal?.addEventListener('abort', cancel, { once: true });
+    });
+    signal?.throwIfAborted();
   }
 
   destroy(): void {
@@ -185,7 +198,7 @@ export interface DownloadJobOptions {
   proxy?: boolean;
 }
 
-/** 无 Cache Storage 的降级：串行下载并立即写出，不落缓存（无断点、并发 1） */
+/** 串行读取分片并立即写出，不落 Cache Storage。 */
 async function runStreamingJob(ctx: {
   parsed: ParsedPlaylist;
   format: 'TS' | 'MP4';
@@ -202,17 +215,19 @@ async function runStreamingJob(ctx: {
     format === 'MP4' ? new StreamingTransmuxer(target, { durationSeconds: parsed.totalDuration }) : undefined;
   for (let i = 1; i <= total; i++) {
     if (signal.aborted) return;
-    await pause.waitIfPaused();
+    await pause.waitIfPaused(signal);
     const buffer = await fetchSegmentWithRetry(parsed.segments[i - 1].url, i, signal);
     if (!buffer) return;
     let data: ArrayBuffer = buffer;
     if (aesKey && parsed.aesConf) {
       data = await decryptSegment(buffer, aesKey, parsed.aesConf.iv, parsed.mediaSequence, i - 1);
     }
+    await pause.waitIfPaused(signal);
     if (transmuxer) await transmuxer.pushAndTransmux(new Uint8Array(data));
     else await target.write(new Uint8Array(data));
     report(i, total, 'downloading');
   }
+  await pause.waitIfPaused(signal);
   if (transmuxer) await transmuxer.finish();
   else await target.close();
 }
@@ -272,11 +287,13 @@ export async function runDownloadJob(opts: DownloadJobOptions): Promise<void> {
   let parsed: ParsedPlaylist;
   let lastErr: unknown;
   for (let attempt = 0; attempt < 2; attempt++) {
+    await pause.waitIfPaused(jobSignal);
     try {
-      parsed = await parseM3u8Playlist(playlistUrl, 0, undefined, { stripLeadAd: true });
+      parsed = await parseM3u8Playlist(playlistUrl, 0, undefined, { stripLeadAd: true, signal: jobSignal });
       lastErr = undefined;
       break;
     } catch (err) {
+      jobSignal.throwIfAborted();
       lastErr = err;
     }
   }
@@ -296,9 +313,8 @@ export async function runDownloadJob(opts: DownloadJobOptions): Promise<void> {
     aesKey = await res.arrayBuffer();
   }
 
-  // —— 无 Cache Storage（HTTP 页面 / 老浏览器）：退化为串行「边下边写」 ——
-  // 没有断点、并发为 1，但功能可用；原先这条路径是直接失败的
-  if (!supportsChunkCache()) {
+  // 桌面输出直接写入 Main 的暂存文件，避免再持有整集的 Cache Storage 副本。
+  if (target.kind === 'native' || !supportsChunkCache()) {
     await runStreamingJob({ parsed, format, aesKey, target, pause, signal: jobSignal, total, report });
     if (!jobSignal.aborted) report(total, total, 'done');
     return;
@@ -316,12 +332,10 @@ export async function runDownloadJob(opts: DownloadJobOptions): Promise<void> {
   report(current, total, 'downloading');
 
   const worker = async (): Promise<void> => {
-    while (cursor < total) {
-      if (jobSignal.aborted) return;
-      await pause.waitIfPaused();
+    for (;;) {
+      await pause.waitIfPaused(jobSignal);
+      if (cursor >= total) return;
       const index = ++cursor; // 1 基
-      if (jobSignal.aborted) return;
-      await pause.waitIfPaused();
       const cached = await cache.match(new Request(chunkKey(index)));
       if (cached) {
         // 已在恢复预统计里计入，不再累加——否则续传时进度重复计数超过 100%
@@ -329,6 +343,7 @@ export async function runDownloadJob(opts: DownloadJobOptions): Promise<void> {
       }
       const buffer = await fetchSegmentWithRetry(parsed.segments[index - 1].url, index, jobSignal);
       if (!buffer) return;
+      jobSignal.throwIfAborted();
       try {
         await cache.put(
           new Request(chunkKey(index)),
@@ -344,11 +359,13 @@ export async function runDownloadJob(opts: DownloadJobOptions): Promise<void> {
       report(current, total, 'downloading');
     }
   };
+  const workers = Array.from({ length: concurrency }, worker);
   try {
-    await Promise.all(Array.from({ length: concurrency }, worker));
+    await Promise.all(workers);
   } catch (err) {
     // 先把在途的其它 worker 掐掉再向上抛：任务已判失败，不该继续耗流量
     hardStop.abort();
+    await Promise.allSettled(workers);
     throw err;
   }
   if (jobSignal.aborted) return;
@@ -361,28 +378,32 @@ export async function runDownloadJob(opts: DownloadJobOptions): Promise<void> {
     const transmuxer = new StreamingTransmuxer(target, { durationSeconds: parsed.totalDuration });
     for (let i = 1; i <= total; i++) {
       if (jobSignal.aborted) return;
-      await pause.waitIfPaused();
+      await pause.waitIfPaused(jobSignal);
       const resp = await cache.match(new Request(chunkKey(i)));
       if (!resp) throw new Error(`分片 ${i} 缓存丢失，请重试`);
       let data = await resp.arrayBuffer();
       if (aesKey && parsed.aesConf) {
         data = await decryptSegment(data, aesKey, parsed.aesConf.iv, parsed.mediaSequence, i - 1);
       }
+      await pause.waitIfPaused(jobSignal);
       await transmuxer.pushAndTransmux(new Uint8Array(data));
     }
+    await pause.waitIfPaused(jobSignal);
     await transmuxer.finish();
   } else {
     for (let i = 1; i <= total; i++) {
       if (jobSignal.aborted) return;
-      await pause.waitIfPaused();
+      await pause.waitIfPaused(jobSignal);
       const resp = await cache.match(new Request(chunkKey(i)));
       if (!resp) throw new Error(`分片 ${i} 缓存丢失，请重试`);
       let data = await resp.arrayBuffer();
       if (aesKey && parsed.aesConf) {
         data = await decryptSegment(data, aesKey, parsed.aesConf.iv, parsed.mediaSequence, i - 1);
       }
+      await pause.waitIfPaused(jobSignal);
       await target.write(new Uint8Array(data));
     }
+    await pause.waitIfPaused(jobSignal);
     await target.close();
   }
   report(total, total, 'done');

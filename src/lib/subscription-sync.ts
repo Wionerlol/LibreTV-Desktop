@@ -107,6 +107,9 @@ export async function syncEnvSubscriptions(subs: { url: string; name?: string }[
  * 对已同步（24h 内）的订阅会跳过，对已成功过的订阅也不会重复导入。
  */
 export async function applyEnvPresets(status: AuthStatusResponse): Promise<void> {
+  if (status.verified && Array.isArray(status.desktopInitialSources)) {
+    useAppStore.getState().initializeDesktopSources(status.desktopInitialSources);
+  }
   if (Array.isArray(status.defaultSources)) {
     useAppStore.getState().setEnvSources(status.defaultSources);
   }

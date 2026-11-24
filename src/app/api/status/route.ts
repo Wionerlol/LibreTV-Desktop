@@ -5,6 +5,7 @@ import { getEnvLiveSources } from '@/lib/env-live-sources';
 import { getEnvSubscriptions } from '@/lib/env-subscriptions';
 import { getEnvRecommendSource } from '@/lib/env-recommend-source';
 import { getEnvImageMode } from '@/lib/env-image-mode';
+import { parseDesktopInitialSources } from '@/lib/desktop-initial-sources';
 
 export const runtime = 'nodejs';
 
@@ -12,6 +13,7 @@ export const runtime = 'nodejs';
 export async function GET(req: Request) {
   const passwordRequired = isPasswordConfigured();
   const verified = passwordRequired && sessionFromCookieHeader(req.headers.get('cookie'));
+  const desktopInitialSources = verified ? parseDesktopInitialSources(process.env.LIBRETV_DESKTOP_INITIAL_SOURCES) : undefined;
   return NextResponse.json({
     passwordRequired,
     verified,
@@ -19,6 +21,7 @@ export async function GET(req: Request) {
     version: process.env.APP_VERSION || 'dev',
     // 部署者通过 DEFAULT_SOURCES 预置的采集站
     defaultSources: getEnvSources(),
+    ...(desktopInitialSources ? { desktopInitialSources } : {}),
     // 部署者通过 DEFAULT_LIVE_SOURCES 预置的直播源（M3U 订阅）
     defaultLiveSources: getEnvLiveSources(),
     // 部署者通过 DEFAULT_SUBSCRIPTIONS 预置的 SourceList 订阅链接

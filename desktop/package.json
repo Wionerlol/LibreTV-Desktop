@@ -1,0 +1,14 @@
+{
+  "name": "libretv-desktop-build",
+  "version": "0.1.0",
+  "private": true,
+  "license": "AGPL-3.0-or-later",
+  "scripts": {
+    "build": "node build.cjs",
+    "build:personal": "node build.cjs --personal-sources"
+  },
+  "devDependencies": {
+    "electron": "44.9.3",
+    "electron-builder": "26.17.0"
+  }
+}
