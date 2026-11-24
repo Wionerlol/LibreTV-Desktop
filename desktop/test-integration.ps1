@@ -4,6 +4,8 @@ param(
     [Parameter(Mandatory)][string] $Executable,
     [ValidateRange(1, 100)][int] $Cycles = 10,
     [string] $FixtureDirectory,
+    [string] $MediaComparisonDirectory,
+    [switch] $MediaOnly,
     [string] $ReuseEvidence,
     [switch] $KnownManagedStartupBlock
 )
@@ -43,6 +45,7 @@ function Get-AsarMembers([string] $Path) {
 $statuses = @('PASS', 'FAIL', 'PARTIAL', 'NOT RUN', 'ENVIRONMENT_BLOCKED')
 $checks = [ordered]@{
     'lifecycle' = 'Windows lifecycle and process ownership'
+    'packaged-integration' = 'Packaged initial and restart smoke phases'
     'next-shutdown' = 'Next.js shutdown waitUntil diagnostics'
     'autologin' = 'Renderer auto-login and protected API'
     'anonymous-access' = 'Anonymous localhost request denied'
@@ -62,7 +65,9 @@ $checks = [ordered]@{
     'vod-search' = 'Synthetic VOD search and detail'
     'media-playback' = 'Authorized media playback'
     'native-download' = 'Native download with size and SHA-256'
+    'mp4-standard-control' = 'Chromium playback of the standard MP4 control'
     'downloaded-file-chromium' = 'Chromium playback of the downloaded MP4'
+    'mp4-remux-control' = 'Chromium playback of the remuxed MP4 control'
     'business-persistence' = 'Business data and task recovery across restart'
     'main-resources' = 'Windows Main startup time, CPU and working set'
     'main-response' = 'Authenticated request timing and Main event loop'
@@ -85,7 +90,8 @@ $candidate = [ordered]@{
     Executable = $Executable; Sha256 = $null; AppAsarSha256 = $null; Commit = $null
     BuildId = $null; Electron = $null; Next = $null; RequestedCycles = $Cycles
     Windows = [Environment]::OSVersion.VersionString; PowerShell = $PSVersionTable.PSVersion.ToString()
-    Mode = if ($ReuseEvidence) { 'reuse-existing-evidence' } else { 'execute-packaged-app' }
+    Mode = if ($ReuseEvidence) { 'reuse-existing-evidence' } elseif ($MediaOnly) { 'execute-packaged-media' } else { 'execute-packaged-app' }
+    MediaOnly = [bool]$MediaOnly; MediaComparison = [bool]$MediaComparisonDirectory
     RuntimeProbe = $null; RendererProbe = $null; LifecycleExitCode = $null
 }
 $rawRows = @()
@@ -96,6 +102,9 @@ $setupError = $null
 $lifecycleLog = $null
 $profileStorageRoot = $null
 try {
+    if ($ReuseEvidence -and ($MediaOnly -or $MediaComparisonDirectory)) {
+        throw 'Media execution options cannot be combined with recorded evidence replay.'
+    }
     $exe = (Get-Item -LiteralPath $Executable).FullName
     $candidate.Executable = $exe
     $candidate.Sha256 = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -107,8 +116,11 @@ try {
     $candidate.RendererProbe = $members.Contains('renderer-acceptance.cjs')
     $candidate.RuntimeProbe = $members.Contains('integration-acceptance.cjs')
     $hasLifecycle = $members.Contains('smoke-control.cjs')
+    if (($MediaOnly -or $MediaComparisonDirectory) -and (!$candidate.RuntimeProbe -or !$hasLifecycle)) {
+        throw 'The selected package cannot run the dedicated media probes.'
+    }
     if (!$candidate.RuntimeProbe) {
-        foreach ($name in @('credential-canary', 'native-fullscreen', 'indexeddb', 'preset-initial', 'preset-restart', 'source-import', 'vod-search', 'media-playback', 'native-download', 'downloaded-file-chromium', 'business-persistence', 'main-response')) {
+        foreach ($name in @('credential-canary', 'native-fullscreen', 'indexeddb', 'preset-initial', 'preset-restart', 'source-import', 'vod-search', 'media-playback', 'native-download', 'mp4-standard-control', 'downloaded-file-chromium', 'mp4-remux-control', 'business-persistence', 'main-response')) {
             Set-Check $name 'NOT RUN' 'The selected package does not contain the dedicated integration probe.'
         }
     }
@@ -136,10 +148,12 @@ try {
         $lifecycleLog = Join-Path $runRoot 'lifecycle.log'
         $flags = @('-Executable', $exe, '-Cycles', $Cycles, '-EvidenceDirectory', $rawRoot)
         if (!$hasLifecycle) { $flags += '-LegacyStartupOnly' }
-        if ($candidate.RendererProbe -and $hasLifecycle) { $flags += '-RequireRendererChecks' }
+        if ($candidate.RendererProbe -and $hasLifecycle -and !$MediaOnly) { $flags += '-RequireRendererChecks' }
         if ($candidate.RuntimeProbe -and $hasLifecycle) {
             $flags += '-RunIntegrationChecks'
             if ($FixtureDirectory) { $flags += @('-FixtureDirectory', $FixtureDirectory) }
+            if ($MediaComparisonDirectory) { $flags += @('-MediaComparisonDirectory', $MediaComparisonDirectory) }
+            if ($MediaOnly) { $flags += '-MediaOnly' }
         }
         $pwsh = Join-Path $PSHOME 'pwsh.exe'
         $PSNativeCommandUseErrorActionPreference = $false
@@ -149,11 +163,26 @@ try {
     }
 
     $identity = Get-Content -LiteralPath (Join-Path $rawRoot 'run.json') -Raw | ConvertFrom-Json
+    $candidate.MediaOnly = [bool]$identity.MediaOnly
+    $candidate.MediaComparison = [bool]$identity.MediaComparison
+    if ($candidate.MediaOnly) { $candidate.RequestedCycles = 0 }
     $profileStorageRoot = $identity.ProfileStorageRoot
     $rawRows = @(Import-Csv -LiteralPath (Join-Path $rawRoot 'startup-shutdown.csv'))
     $failures = @($rawRows | Where-Object Status -eq 'FAIL')
     $blocked = @($rawRows | Where-Object Status -eq 'ENVIRONMENT_BLOCKED')
     $normal = @($rawRows | Where-Object { $_.Case -match '^normal-\d+$' -and $_.Status -eq 'PASS' })
+    $integrationCase = $rawRows | Where-Object Case -eq 'packaged-integration' | Select-Object -First 1
+    $integrationPassed = $integrationCase.Status -eq 'PASS'
+    if ($candidate.RuntimeProbe -and $hasLifecycle -and $integrationCase) {
+        $integrationStatus = $integrationCase.Status
+        $integrationDetail = 'The isolated packaged initial and restart phases completed.'
+        if ($integrationStatus -ne 'PASS') { $integrationDetail = 'The packaged phases did not both complete. See the raw lifecycle evidence.' }
+        if ($KnownManagedStartupBlock -and $integrationStatus -eq 'FAIL' -and $integrationCase.Observed -match '0x80000003\) before ready\. Events:\s*$') {
+            $integrationStatus = 'ENVIRONMENT_BLOCKED'
+            $integrationDetail = 'Known managed-environment breakpoint before any Main log. Raw lifecycle evidence preserves the observed exit.'
+        }
+        Set-Check packaged-integration $integrationStatus $integrationDetail
+    }
     $processOutput = Join-Path $rawRoot 'process-output'
     if (Test-Path -LiteralPath $processOutput -PathType Container) {
         $stderr = @(Get-ChildItem -LiteralPath $processOutput -Filter '*.stderr.log' -File -Attributes '!ReparsePoint')
@@ -163,7 +192,8 @@ try {
             $waitUntilErrors = @(Select-String -LiteralPath $captured.FullName -SimpleMatch 'Cannot call waitUntil() on an AwaiterOnce that was already awaited')
             if ($waitUntilErrors.Count) {
                 Set-Check next-shutdown FAIL "$($waitUntilErrors.Count) AwaiterOnce race messages in captured Electron output."
-            } elseif ($normal.Count -and $stderr.Count -ge $normal.Count -and $stdout.Count -ge $normal.Count) {
+            } elseif (($normal.Count -and $stderr.Count -ge $normal.Count -and $stdout.Count -ge $normal.Count) -or
+                ($candidate.MediaOnly -and $integrationPassed -and $stderr.Count -ge 2 -and $stdout.Count -ge 2)) {
                 Set-Check next-shutdown PASS 'The known AwaiterOnce race was absent from the captured Electron output.'
             }
         }
@@ -180,12 +210,14 @@ try {
         }
     } elseif ($blocked.Count) {
         Set-Check lifecycle ENVIRONMENT_BLOCKED ($blocked.Case -join ', ')
+    } elseif ($candidate.MediaOnly) {
+        Set-Check lifecycle 'NOT RUN' 'The targeted run omits normal cycles and lifecycle fault cases.'
     } elseif ($normal.Count -eq $Cycles -and $verified.Count -eq $needs.Count) {
         Set-Check lifecycle PASS "$Cycles normal cycles and four lifecycle fault cases passed."
     } elseif ($normal.Count -or @($rawRows | Where-Object Status -eq 'PASS').Count) {
         Set-Check lifecycle PARTIAL 'Lifecycle evidence did not cover all required cases.'
     }
-    if ($normal.Count) { Set-Check anonymous-access PASS 'The external Windows HTTP client received 403 from the authenticated running app.' }
+    if ($normal.Count -or ($candidate.MediaOnly -and $integrationPassed)) { Set-Check anonymous-access PASS 'The external Windows HTTP client received 403 from the authenticated running app.' }
     elseif ($rawRows.Observed -contains 'External caller received a non-403 status') {
         Set-Check anonymous-access FAIL 'The anonymous client received an unexpected status.'
     }
@@ -232,7 +264,14 @@ try {
         foreach ($property in $observation.metrics.PSObject.Properties) {
             $numeric = $property.Value -is [ValueType] -and $property.Value -isnot [DateTime]
             $digest = $property.Name -match 'sha256$' -and [string]$property.Value -cmatch '^[a-fA-F0-9]{64}$'
-            if ($property.Name -cmatch '^[A-Za-z][A-Za-z0-9_]{0,79}$' -and ($numeric -or $digest)) {
+            $mediaEnum = switch -CaseSensitive ($property.Name) {
+                'playError' { $property.Value -cin @('NotAllowedError', 'AbortError', 'NotSupportedError', 'OtherError') }
+                'visibility' { $property.Value -cin @('visible', 'hidden') }
+                'codecSupport' { $property.Value -cin @('probably', 'maybe', '') }
+                'interruption' { $property.Value -cin @('NEW_LOAD', 'PAUSE_CALL', 'REMOVED', 'UNCLASSIFIED') }
+                default { $false }
+            }
+            if ($property.Name -cmatch '^[A-Za-z][A-Za-z0-9_]{0,79}$' -and ($numeric -or $digest -or $mediaEnum)) {
                 $metrics[$property.Name] = $property.Value
             }
         }
@@ -242,6 +281,8 @@ try {
         if ($status -eq 'FAIL' -or !$detail -or $detail.Length -gt 280 -or $detail -match '[\r\n|]|https?://|[A-Za-z]:\\|[?=&]') {
             $detail = 'Recorded by the packaged integration probe.'
             if ($code) { $detail += " ($code)" }
+            if ($metrics.playError) { $detail += " Exception $($metrics.playError)." }
+            if ($metrics.interruption) { $detail += " Interruption $($metrics.interruption)." }
         }
         Set-Check $name $status $detail
     }
@@ -305,7 +346,15 @@ try {
     Write-Output "Integration report: $(Join-Path $runRoot 'acceptance.md')"
 }
 
-$required = @($results.Values | Where-Object Check -notin @('long-playback-downloads', 'protected-install', 'filesystem-matrix', 'docker-runtime'))
-if ($required.Status -contains 'FAIL' -or @($rawRows | Where-Object { $_.Case -in @('renderer-compatibility', 'packaged-integration') -and $_.Status -eq 'FAIL' }).Count) { exit 1 }
+$optional = @('long-playback-downloads', 'protected-install', 'filesystem-matrix', 'docker-runtime')
+if (!$candidate.MediaComparison) { $optional += @('mp4-standard-control', 'mp4-remux-control') }
+if (!$candidate.RuntimeProbe -or !$hasLifecycle) { $optional += 'packaged-integration' }
+$required = @($results.Values | Where-Object Check -notin $optional)
+if ($candidate.MediaOnly) {
+    $focusedChecks = @('packaged-integration', 'autologin', 'anonymous-access', 'media-playback', 'native-download', 'downloaded-file-chromium', 'mp4-standard-control', 'mp4-remux-control', 'business-persistence')
+    $required = @($required | Where-Object Check -in $focusedChecks)
+}
+if ($setupError -or @($results.Values | Where-Object { $_.Check -notin $optional -and $_.Status -eq 'FAIL' }).Count -or
+    @($rawRows | Where-Object { $_.Case -eq 'renderer-compatibility' -and $_.Status -eq 'FAIL' }).Count) { exit 1 }
 if (@($required | Where-Object Status -ne 'PASS').Count) { exit 2 }
 exit 0

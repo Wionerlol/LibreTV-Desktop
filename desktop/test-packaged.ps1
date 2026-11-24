@@ -7,16 +7,20 @@ param(
     [switch] $RequireRendererChecks,
     [string] $EvidenceDirectory,
     [switch] $RunIntegrationChecks,
-    [string] $FixtureDirectory
+    [string] $FixtureDirectory,
+    [string] $MediaComparisonDirectory,
+    [switch] $MediaOnly
 )
 
 if ($LegacyStartupOnly -and ($RequireRendererChecks -or $RunIntegrationChecks)) { throw 'Renderer checks require a current lifecycle build.' }
+if (($MediaOnly -or $MediaComparisonDirectory) -and !$RunIntegrationChecks) { throw 'Media options require -RunIntegrationChecks.' }
+if ($MediaOnly -and $RequireRendererChecks) { throw 'Media-only runs omit the independent renderer compatibility lifecycle.' }
 
 $ErrorActionPreference = 'Stop'
 $exe = (Get-Item -LiteralPath $Executable).FullName
 $artifacts = Join-Path (Split-Path -Parent $PSScriptRoot) 'artifacts'
 $validation = Join-Path $artifacts 'validation'
-$runKind = if ($LegacyStartupOnly) { 'p1-legacy-startup-' } else { 'desktop-lifecycle-' }
+$runKind = if ($LegacyStartupOnly) { 'p1-legacy-startup-' } elseif ($MediaOnly) { 'desktop-media-' } else { 'desktop-lifecycle-' }
 $runRoot = if ($EvidenceDirectory) { [IO.Path]::GetFullPath($EvidenceDirectory) } else {
     Join-Path $validation ($runKind + [guid]::NewGuid().ToString('N'))
 }
@@ -34,9 +38,11 @@ Write-Output "Smoke profile data directory: $profileStorageRoot"
     Sha256 = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
     Windows = [Environment]::OSVersion.VersionString
     PowerShell = $PSVersionTable.PSVersion.ToString()
-    Mode = if ($LegacyStartupOnly) { 'legacy-startup-only' } else { 'file-v1-lifecycle' }
+    Mode = if ($LegacyStartupOnly) { 'legacy-startup-only' } elseif ($MediaOnly) { 'file-v1-media' } else { 'file-v1-lifecycle' }
     RequireRendererChecks = [bool]$RequireRendererChecks
     RunIntegrationChecks = [bool]$RunIntegrationChecks
+    MediaOnly = [bool]$MediaOnly
+    MediaComparison = [bool]$MediaComparisonDirectory
     ProfileStorageRoot = $profileStorageRoot
     AppAsarSha256 = (Get-FileHash -LiteralPath (Join-Path (Split-Path -Parent $exe) 'resources\app.asar') -Algorithm SHA256).Hash.ToLowerInvariant()
 }) | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $runRoot 'run.json') -Encoding UTF8
@@ -45,8 +51,10 @@ $processes = [Collections.Generic.List[System.Diagnostics.Process]]::new()
 $results = [Collections.Generic.List[object]]::new()
 $snapshots = [Collections.Generic.List[object]]::new()
 $resourceSamples = [Collections.Generic.List[object]]::new()
-$planned = if ($LegacyStartupOnly) { @('legacy-startup') } else {
-    @(1..$Cycles | ForEach-Object { "normal-$_" }) +
+$planned = @()
+if ($LegacyStartupOnly) { $planned += 'legacy-startup' }
+elseif (!$MediaOnly) {
+    $planned += @(1..$Cycles | ForEach-Object { "normal-$_" }) +
         @('second-instance', 'port-conflict', 'force-kill-restart', 'missing-runtime-config')
 }
 if ($RunIntegrationChecks) { $planned += 'packaged-integration' }
@@ -119,10 +127,41 @@ function Get-Events([string] $ProfileId, [int] $RootId) {
     }
 }
 
+function Copy-MediaComparisonFixtures([string] $Destination) {
+    if (!$MediaComparisonDirectory) { return }
+    if (![IO.Path]::IsPathFullyQualified($MediaComparisonDirectory)) { throw 'The media comparison directory must be an absolute path.' }
+    $directory = Get-Item -LiteralPath $MediaComparisonDirectory
+    if ($directory -isnot [IO.DirectoryInfo]) { throw 'The media comparison path must be a file system directory.' }
+    for ($parent = $directory; $parent; $parent = $parent.Parent) {
+        if ($parent.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'The media comparison directory cannot traverse a reparse point.' }
+    }
+
+    $controls = Join-Path $Destination 'mp4-controls'
+    New-Item -ItemType Directory -Path $controls | Out-Null
+    foreach ($name in @('control-standard.mp4', 'app-download.mp4', 'app-remux.mp4')) {
+        $file = Get-Item -LiteralPath (Join-Path $directory.FullName $name)
+        if ($file -isnot [IO.FileInfo] -or ($file.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw "Invalid MP4 comparison fixture: $name"
+        }
+        $inputStream = [IO.File]::Open($file.FullName, 'Open', 'Read', 'Read')
+        try {
+            if ($inputStream.Length -lt 1024 -or $inputStream.Length -gt 1MB -or
+                ([IO.File]::GetAttributes($file.FullName) -band [IO.FileAttributes]::ReparsePoint)) {
+                throw "Invalid MP4 comparison fixture: $name"
+            }
+            $output = [IO.File]::Open((Join-Path $controls $name), 'CreateNew', 'Write', 'None')
+            try { $inputStream.CopyTo($output) } finally { $output.Dispose() }
+        } finally {
+            $inputStream.Dispose()
+        }
+    }
+}
+
 function Add-IntegrationFixtures([string] $ProfileId) {
     $workspace = Split-Path -Parent $PSScriptRoot
     $destination = Join-Path (Get-ProfilePath $ProfileId) 'acceptance-fixtures'
     New-Item -ItemType Directory -Path $destination | Out-Null
+    Copy-MediaComparisonFixtures $destination
     $historical = Join-Path $workspace 'artifacts\fixtures\libretv-historical-sources.json'
     if (Test-Path -LiteralPath $historical -PathType Leaf) {
         Copy-Item -LiteralPath $historical -Destination (Join-Path $destination 'sources.json')
@@ -291,76 +330,78 @@ try {
         return
     }
 
-    foreach ($index in 1..$Cycles) {
-        $case = "normal-$index"
+    if (!$MediaOnly) {
+        foreach ($index in 1..$Cycles) {
+            $case = "normal-$index"
+            $main = $null
+            $id = [guid]::NewGuid().ToString('N')
+            $main = Start-Smoke $id
+            $events = Wait-Smoke $main $id
+            Assert-Running $main $events
+            Assert-NormalExit $main $id
+            Record-Pass $main.Id 'Main owns 17888, renderer and API checks pass, port and children released'
+        }
+
+        $case = 'second-instance'
+        $main = $null
+        $id = [guid]::NewGuid().ToString('N')
+        $main = Start-Smoke $id
+        $events = Wait-Smoke $main $id
+        $second = Start-Smoke $id
+        Assert-Observed ($second.WaitForExit(5000) -and $second.ExitCode -eq 0) 'Second launch did not exit cleanly'
+        Assert-Running $main $events
+        Assert-Observed ((@(Get-Events $id $main.Id).stage) -contains 'second-instance') 'Main did not receive second launch'
+        Assert-NormalExit $main $id
+        Record-Pass $main.Id 'Second launch signaled the existing app and never owned the listener'
+
+        $case = 'port-conflict'
+        $main = $null
+        $holder = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 17888)
+        $holder.ExclusiveAddressUse = $true
+        $holder.Start()
+        try {
+            $id = [guid]::NewGuid().ToString('N')
+            $main = Start-Smoke $id
+            Assert-Observed ($main.WaitForExit(12000) -and $main.ExitCode -eq 1) 'Occupied port did not fail startup'
+            $events = @(Get-Events $id $main.Id)
+            Assert-Observed (($events | Where-Object stage -eq 'boot-failed').code -eq 'EADDRINUSE') 'Expected the native port-conflict diagnostic'
+            Assert-Observed ($events.stage -notcontains 'renderer-loaded' -and $events.stage -notcontains 'owned-listener') 'Startup proceeded without owning the listener'
+            Assert-Observed (!$holder.Pending() -and @(Get-Listeners).Owner -eq $PID) 'The occupied listener received a connection or changed owners'
+            Record-Pass $main.Id 'EADDRINUSE, zero connections to test listener, holder remains active'
+        } finally {
+            $holder.Stop()
+        }
+
+        $case = 'force-kill-restart'
         $main = $null
         $id = [guid]::NewGuid().ToString('N')
         $main = Start-Smoke $id
         $events = Wait-Smoke $main $id
         Assert-Running $main $events
-        Assert-NormalExit $main $id
-        Record-Pass $main.Id 'Main owns 17888, renderer and API checks pass, port and children released'
-    }
-
-    $case = 'second-instance'
-    $main = $null
-    $id = [guid]::NewGuid().ToString('N')
-    $main = Start-Smoke $id
-    $events = Wait-Smoke $main $id
-    $second = Start-Smoke $id
-    Assert-Observed ($second.WaitForExit(5000) -and $second.ExitCode -eq 0) 'Second launch did not exit cleanly'
-    Assert-Running $main $events
-    Assert-Observed ((@(Get-Events $id $main.Id).stage) -contains 'second-instance') 'Main did not receive second launch'
-    Assert-NormalExit $main $id
-    Record-Pass $main.Id 'Second launch signaled the existing app and never owned the listener'
-
-    $case = 'port-conflict'
-    $main = $null
-    $holder = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 17888)
-    $holder.ExclusiveAddressUse = $true
-    $holder.Start()
-    try {
-        $id = [guid]::NewGuid().ToString('N')
+        $crashed = $main.Id
+        $main.Kill()
+        Assert-Observed ($main.WaitForExit(8000)) 'Force-killed Main did not exit'
+        Assert-Released $crashed
         $main = Start-Smoke $id
-        Assert-Observed ($main.WaitForExit(12000) -and $main.ExitCode -eq 1) 'Occupied port did not fail startup'
+        $events = Wait-Smoke $main $id
+        Assert-Running $main $events
+        Assert-NormalExit $main $id
+        Record-Pass $main.Id "Force-stopped PID $crashed, released port/tree and relaunched with the same test profile"
+
+        $case = 'missing-runtime-config'
+        $main = $null
+        $broken = Join-Path $runRoot 'missing-config-fixture'
+        Copy-Item -LiteralPath (Split-Path -Parent $exe) -Destination $broken -Recurse
+        $copiedConfig = Join-Path $broken 'resources\libretv-runtime\next.config.js'
+        Rename-Item -LiteralPath $copiedConfig -NewName 'next.config.js.omitted'
+        $id = [guid]::NewGuid().ToString('N')
+        $main = Start-Smoke $id -Binary (Join-Path $broken (Split-Path -Leaf $exe))
+        Assert-Observed ($main.WaitForExit(10000) -and $main.ExitCode -eq 1) 'Missing runtime config did not fail startup'
         $events = @(Get-Events $id $main.Id)
-        Assert-Observed (($events | Where-Object stage -eq 'boot-failed').code -eq 'EADDRINUSE') 'Expected the native port-conflict diagnostic'
-        Assert-Observed ($events.stage -notcontains 'renderer-loaded' -and $events.stage -notcontains 'owned-listener') 'Startup proceeded without owning the listener'
-        Assert-Observed (!$holder.Pending() -and @(Get-Listeners).Owner -eq $PID) 'The occupied listener received a connection or changed owners'
-        Record-Pass $main.Id 'EADDRINUSE, zero connections to test listener, holder remains active'
-    } finally {
-        $holder.Stop()
+        Assert-Observed (($events | Where-Object stage -eq 'boot-failed').code -eq 'RUNTIME_ASSETS' -and $events.stage -notcontains 'owned-listener') 'Missing configuration was not detected before serving'
+        Assert-Released $main.Id
+        Record-Pass $main.Id 'Missing JavaScript config detected before binding'
     }
-
-    $case = 'force-kill-restart'
-    $main = $null
-    $id = [guid]::NewGuid().ToString('N')
-    $main = Start-Smoke $id
-    $events = Wait-Smoke $main $id
-    Assert-Running $main $events
-    $crashed = $main.Id
-    $main.Kill()
-    Assert-Observed ($main.WaitForExit(8000)) 'Force-killed Main did not exit'
-    Assert-Released $crashed
-    $main = Start-Smoke $id
-    $events = Wait-Smoke $main $id
-    Assert-Running $main $events
-    Assert-NormalExit $main $id
-    Record-Pass $main.Id "Force-stopped PID $crashed, released port/tree and relaunched with the same test profile"
-
-    $case = 'missing-runtime-config'
-    $main = $null
-    $broken = Join-Path $runRoot 'missing-config-fixture'
-    Copy-Item -LiteralPath (Split-Path -Parent $exe) -Destination $broken -Recurse
-    $copiedConfig = Join-Path $broken 'resources\libretv-runtime\next.config.js'
-    Rename-Item -LiteralPath $copiedConfig -NewName 'next.config.js.omitted'
-    $id = [guid]::NewGuid().ToString('N')
-    $main = Start-Smoke $id -Binary (Join-Path $broken (Split-Path -Leaf $exe))
-    Assert-Observed ($main.WaitForExit(10000) -and $main.ExitCode -eq 1) 'Missing runtime config did not fail startup'
-    $events = @(Get-Events $id $main.Id)
-    Assert-Observed (($events | Where-Object stage -eq 'boot-failed').code -eq 'RUNTIME_ASSETS' -and $events.stage -notcontains 'owned-listener') 'Missing configuration was not detected before serving'
-    Assert-Released $main.Id
-    Record-Pass $main.Id 'Missing JavaScript config detected before binding'
 
     if ($RunIntegrationChecks) {
         $case = 'packaged-integration'

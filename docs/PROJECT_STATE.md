@@ -4,6 +4,8 @@
 
 ## 第四轮 — Integration Validation & Stabilization
 
+- 功能验收收尾诊断包 desktop-o8JHkX，Windows x64 个人版，源码 d1a296ef178becb7d437c7f7f0f27cff2ecda174，EXE SHA-256 2ab59ed20c1b4db4b2c16eeb0bc186f5930f5200f05ce1ee5c528cac525268e2。普通 MP4、实际下载文件和仅重封装文件均通过 FFmpeg 完整解码。三路 Electron 测试共享窗口、Session、CSP 和 Blob 路径，记录异常、媒体事件及播放时间。普通 Windows 新包三路对照为 NOT RUN，托管 GUI 启动受审批策略阻断。前次通过的落盘和跨重启对账继续有效，原 Chromium Blob 失败保留。P7 实际截图待核心媒体复验。参见[对照证据](../artifacts/validation/round4/mp4-comparison-readiness.md)。
+
 - Windows x64 个人验收修复包 desktop-J49Qmc 构建与包内校验 PASS，源码提交 36937fa4df02c3d31e470cafc07e733ee2855801，EXE SHA-256 f72a5b04154f913641f2e09f7e67beabd07ce49f4cfb8a6a1abbf6e910d88844。MP4 时长修复后的文件通过生产下载器、Windows 写入、FFmpeg 全文件解码及 3 秒定位。新报告区分文件落盘与 Chromium 播放，并保留重启所需的 SHA-256。普通 Windows 实机复验 PASS 的项目包括授权 HLS 播放、下载落盘、历史与进度恢复、下载任务恢复及重启后的输出 SHA-256 对账。实际保存 129,203 字节，SHA-256 与修复后生产下载夹具一致。Chromium 下载后播放复核仍为 FAIL（DOWNLOAD_CHROMIUM_PLAY_REJECTED）。浏览器已读到 160 像素视频和 7.443 秒时长，拒绝类型未记录。
 
 - 普通 Windows 实机运行 `desktop-FVcFgW`。一次正常启停及四项故障场景、自动登录及受保护 API、三例原生全屏、缩短 Profile 后的 Chromium IndexedDB 读写与重启均 PASS。授权合成 HLS 经过 ArtPlayer 实际解码、播放、跳转和暂停，结果 PASS。源导入及搜索到播放页使用隔离夹具，范围为 PARTIAL。
