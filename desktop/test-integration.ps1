@@ -268,7 +268,7 @@ try {
                 'playError' { $property.Value -cin @('NotAllowedError', 'AbortError', 'NotSupportedError', 'OtherError') }
                 'visibility' { $property.Value -cin @('visible', 'hidden') }
                 'codecSupport' { $property.Value -cin @('probably', 'maybe', '') }
-                'interruption' { $property.Value -cin @('NEW_LOAD', 'PAUSE_CALL', 'REMOVED', 'UNCLASSIFIED') }
+                'interruption' { $property.Value -cin @('NEW_LOAD', 'PAUSE_CALL', 'REMOVED', 'BACKGROUND_HIDDEN', 'UNCLASSIFIED') }
                 default { $false }
             }
             if ($property.Name -cmatch '^[A-Za-z][A-Za-z0-9_]{0,79}$' -and ($numeric -or $digest -or $mediaEnum)) {

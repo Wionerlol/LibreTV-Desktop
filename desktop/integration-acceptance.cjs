@@ -496,7 +496,10 @@ function observeIndexedDb() {
   });
 }
 
-async function verifyPlaybackFile(base64) {
+async function verifyPlaybackFile(base64, expectedVisibility) {
+  if (expectedVisibility && document.visibilityState !== expectedVisibility) {
+    return { passed: false, code: 'MP4_WINDOW_VISIBILITY_MISMATCH', metrics: { visibility: document.visibilityState } };
+  }
   const bytes = Uint8Array.from(atob(base64), (character) => character.charCodeAt(0));
   const video = document.createElement('video');
   const url = URL.createObjectURL(new Blob([bytes], { type: 'video/mp4' }));
@@ -542,6 +545,9 @@ async function verifyPlaybackFile(base64) {
         if (firstFrameTime === undefined) firstFrameTime = video.currentTime;
         if (video.currentTime - firstFrameTime < 0.15) return;
         // The authorized fixtures contain approximately six seconds of content.
+        if (expectedVisibility && document.visibilityState !== expectedVisibility) {
+          return finish(false, 'MP4_WINDOW_VISIBILITY_MISMATCH');
+        }
         const durationMatches = video.duration >= 5 && video.duration <= 8;
         finish(durationMatches, durationMatches ? undefined : 'DOWNLOAD_CHROMIUM_DURATION_MISMATCH');
       }, 80);
@@ -556,6 +562,7 @@ async function verifyPlaybackFile(base64) {
           : /a new load request/i.test(message) ? 'NEW_LOAD'
           : /a call to pause/i.test(message) ? 'PAUSE_CALL'
           : /removed from the document/i.test(message) ? 'REMOVED'
+          : /background media was paused to save power|media-playback-while-not-visible/i.test(message) ? 'BACKGROUND_HIDDEN'
           : 'UNCLASSIFIED';
         finish(false, 'DOWNLOAD_CHROMIUM_PLAY_REJECTED', playError, interruption);
       });
@@ -571,10 +578,10 @@ async function verifyPlaybackFile(base64) {
   }
 }
 
-async function probeMp4(window, name, bytes, sha256) {
+async function probeMp4(window, name, bytes, sha256, expectedVisibility = 'visible') {
   try {
     const playback = await window.webContents.executeJavaScript(
-      '(' + verifyPlaybackFile.toString() + ')(' + JSON.stringify(bytes.toString('base64')) + ')', true);
+      '(' + verifyPlaybackFile.toString() + ')(' + JSON.stringify(bytes.toString('base64')) + ', ' + JSON.stringify(expectedVisibility) + ')', true);
     return {
       name, status: playback.passed ? 'PASS' : 'FAIL', code: playback.code,
       detail: 'Chromium 复核 MP4 的视频帧和播放进度',
@@ -629,6 +636,48 @@ async function compareMp4Controls(window, profile, downloadSha256) {
   return checks;
 }
 
+async function waitForVisiblePage() {
+  if (document.visibilityState === 'visible') return true;
+  return new Promise((resolve) => {
+    const finish = (visible) => {
+      clearTimeout(timer);
+      document.removeEventListener('visibilitychange', onVisibility);
+      resolve(visible);
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') finish(true);
+    };
+    const timer = setTimeout(() => finish(false), 3000);
+    document.addEventListener('visibilitychange', onVisibility);
+  });
+}
+
+async function observeVisibleMp4(window, profile, output, log) {
+  let restoreHidden = false;
+  const failure = (code) => [{ name: 'downloaded-file-chromium', status: 'FAIL', code }];
+  try {
+    restoreHidden = !window.isVisible();
+    if (restoreHidden) {
+      if (output) {
+        // Retain the hidden reference without letting it decide foreground acceptance.
+        const hidden = await probeMp4(window, 'mp4-hidden-reference', output.bytes, output.sha256, 'hidden');
+        log('integration-diagnostic', hidden);
+      }
+      window.showInactive();
+    }
+    if (!await window.webContents.executeJavaScript('(' + waitForVisiblePage.toString() + ')()')) {
+      return failure('MP4_VISIBLE_WINDOW_TIMEOUT');
+    }
+    const checks = [];
+    if (output) checks.push(await probeMp4(window, 'downloaded-file-chromium', output.bytes, output.sha256));
+    return [...checks, ...await compareMp4Controls(window, profile, output?.sha256)];
+  } catch {
+    return failure('MP4_VISIBLE_WINDOW_ERROR');
+  } finally {
+    if (restoreHidden && !window.isDestroyed()) window.hide();
+  }
+}
+
 async function observeBusiness(window, log, { profile, phase, origin, fixture }) {
   verifySmokeProfile(profile);
   if (phase !== 'initial' && phase !== 'restart') throw new Error('Invalid integration phase');
@@ -660,8 +709,9 @@ async function observeBusiness(window, log, { profile, phase, origin, fixture })
   try {
     if (phase === 'initial' && observed.observed) {
       const download = observed.checks.find((check) => check.name === 'native-download');
+      let output;
       if (download?.status === 'PASS') {
-        const output = await inspectDownload(profile);
+        output = await inspectDownload(profile);
         if (!output) {
           download.status = 'FAIL';
           download.code = 'DOWNLOAD_FILE_UNAVAILABLE';
@@ -671,11 +721,11 @@ async function observeBusiness(window, log, { profile, phase, origin, fixture })
           observed.observed.downloadSha256 = output.sha256;
           Object.assign(download.metrics, { bytes: output.bytes.length, sha256: output.sha256 });
           download.detail += '。文件已读回并计算 SHA-256。';
-          observed.checks.push(await probeMp4(window, 'downloaded-file-chromium', output.bytes, output.sha256));
         }
       }
-      observed.checks.push(...await compareMp4Controls(window, profile, observed.observed.downloadSha256));
       await fs.writeFile(path.join(profile, 'acceptance-observed.json'), JSON.stringify(observed.observed), { flag: 'wx' });
+      const controls = await fs.lstat(path.join(profile, 'acceptance-fixtures', 'mp4-controls')).catch(() => null);
+      if (output || controls) observed.checks.push(...await observeVisibleMp4(window, profile, output, log));
     } else if (phase === 'restart' && args.previous?.downloadSha256) {
       const output = await inspectDownload(profile);
       const persistence = observed.checks.find((check) => check.name === 'business-persistence');
